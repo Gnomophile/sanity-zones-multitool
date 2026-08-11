@@ -1,0 +1,1066 @@
+// ==UserScript==
+// @name         Sanity — мультитул по зонам (Mass Update)
+// @namespace    starterapp-delivery-zones
+// @version      5.0
+// @description  Чекбоксы, копирование/вставка зон, массовое редактирование условий доставки (+ массовое применение к нескольким ресторанам с выбором конкретных зон в каждом, исключая архив)
+// @match        https://my.starterapp.ru/*
+// @grant        none
+// @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/Gnomophile/sanity-multitool/main/sanity-multitool.user.js
+// @downloadURL  https://raw.githubusercontent.com/Gnomophile/sanity-multitool/main/sanity-multitool.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  let clipboard   = null;
+  let isInjecting = false;
+
+  // ---------------------------------------------------------------------
+  // Определение Project ID.
+  // ---------------------------------------------------------------------
+  let cachedProjectId = null;
+  let cachedWorkspace = null;
+
+  const PROJECT_ID_LOG_RE = /SANITY PROJECT ID[\s>:=-]*([a-z0-9]{6,})/i;
+  const origConsoleWarn = console.warn.bind(console);
+
+  function currentWorkspace() {
+    return window.location.pathname.split('/').filter(Boolean)[0] || null;
+  }
+
+  function setCachedProjectId(id) {
+    cachedProjectId = id;
+    cachedWorkspace  = currentWorkspace();
+  }
+
+  function tryCaptureFromArgs(args) {
+    const combined = args
+      .filter(a => typeof a === 'string' || typeof a === 'number')
+      .join(' ');
+    if (!combined.includes('SANITY PROJECT ID')) return;
+    const m = combined.match(PROJECT_ID_LOG_RE);
+    if (m) {
+      setCachedProjectId(m[1]);
+    } else {
+      origConsoleWarn('[SZ] Нашёл "SANITY PROJECT ID" в логе, но не смог извлечь id из:', combined);
+    }
+  }
+
+  for (const method of ['log', 'info', 'warn', 'debug']) {
+    const orig = console[method].bind(console);
+    console[method] = function (...args) {
+      tryCaptureFromArgs(args);
+      return orig(...args);
+    };
+  }
+
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : input?.url;
+    const m = url && url.match(/^https?:\/\/([a-z0-9]+)\.api\.sanity\.io/);
+    if (m) setCachedProjectId(m[1]);
+    return origFetch.call(this, input, init);
+  };
+
+  function getProjectId() {
+    const ws = currentWorkspace();
+    if (cachedProjectId && cachedWorkspace === ws) return cachedProjectId;
+    if (cachedProjectId && cachedWorkspace !== ws) return null;
+    const entries = performance.getEntriesByType('resource').map(e => e.name);
+    const entry = entries.find(n => n.includes('.api.sanity.io'));
+    const fromPerf = entry?.match(/^https?:\/\/([a-z0-9]+)\.api\.sanity\.io/)?.[1] || null;
+    if (fromPerf) setCachedProjectId(fromPerf);
+    return cachedProjectId;
+  }
+
+  function newKey() {
+    const arr = new Uint8Array(6);
+    crypto.getRandomValues(arr);
+    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function deepClone(zone) {
+    const c = JSON.parse(JSON.stringify(zone));
+    c._key = newKey();
+    if (Array.isArray(c.deliveryTypePrices)) {
+      c.deliveryTypePrices = c.deliveryTypePrices.map(d => {
+        const dc = { ...d, _key: newKey() };
+        if (Array.isArray(dc.deliveryPrice)) dc.deliveryPrice = dc.deliveryPrice.map(p => ({ ...p, _key: newKey() }));
+        return dc;
+      });
+    }
+    return c;
+  }
+
+  function getShopId() {
+    return window.location.href.match(/shops-item;shops;([a-f0-9-]{36})/)?.[1] || null;
+  }
+
+  function getAuthHeaders(projectId) {
+    const tokenData = JSON.parse(localStorage.getItem(`__studio_auth_token_${projectId}`) || 'null');
+    if (tokenData?.token) return { 'Authorization': `Bearer ${tokenData.token}` };
+    return {};
+  }
+
+  async function apiFetch(projectId, path, options = {}) {
+    const base = `https://${projectId}.api.sanity.io/v2024-05-28`;
+    const headers = { ...getAuthHeaders(projectId), ...(options.headers || {}) };
+    return fetch(`${base}${path}`, { ...options, headers, credentials: 'include' });
+  }
+
+  async function getDoc(projectId, id) {
+    const r = await apiFetch(projectId, `/data/doc/production/drafts.${id},${id}`);
+    const { documents } = await r.json();
+    return documents.find(d => d._id === `drafts.${id}`) || documents.find(d => d._id === id) || null;
+  }
+
+  // Запрос списка всех актуальных ресторанов текущего workspace (исключая архив),
+  // вместе с их зонами доставки (_key + name), нужен для двухуровневого каталога
+  // в массовом применении условий.
+  async function fetchAllShops(projectId) {
+    const query = encodeURIComponent(
+      `*[_type == "shop" && !(_id in path("drafts.**")) && isArchived != true] | order(name.ru asc) {
+        _id, name, address,
+        "zones": deliveryZones[]{_key, name}
+      }`
+    );
+    const r = await apiFetch(projectId, `/data/query/production?query=${query}`);
+    if (!r.ok) throw new Error("Не удалось загрузить список ресторанов");
+    const { result } = await r.json();
+    return result;
+  }
+
+  async function resolveDeliveryTypeNames(projectId, refs) {
+    if (!refs.length) return {};
+    const r = await apiFetch(projectId, `/data/doc/production/${refs.join(',')}`);
+    const { documents } = await r.json();
+    const map = {};
+    for (const d of documents) map[d._id] = d.name?.ru || d.title?.ru || d._id;
+    return map;
+  }
+
+  function getAddress(doc) {
+    const street = doc.address?.street?.ru || '';
+    const house  = doc.address?.house?.ru  || '';
+    if (street && house) return `${street}, ${house}`;
+    return street || doc.name?.ru || doc._id;
+  }
+
+  function showToast(message, type = 'info', duration = 5000) {
+    const existing = document.getElementById('sz-toast');
+    if (existing) existing.remove();
+    const colors = { info: '#4a90e2', success: '#27ae60', error: '#e74c3c', warning: '#f39c12' };
+    const toast = document.createElement('div');
+    toast.id = 'sz-toast';
+    toast.style.cssText = `
+      position:fixed; bottom:24px; right:24px; z-index:999999;
+      background:${colors[type]}; color:#fff;
+      padding:12px 18px; border-radius:8px; font-size:14px;
+      box-shadow:0 4px 12px rgba(0,0,0,0.2); max-width:420px; max-height:70vh; overflow-y:auto;
+      line-height:1.5; white-space:pre-line; transition:opacity 0.3s;
+    `;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, duration);
+  }
+
+  function updateCopyButtonLabel() {
+    const fieldset = document.querySelector('fieldset[data-testid="field-deliveryZones"]');
+    if (!fieldset) return;
+    const copyBtn = fieldset.querySelector('[data-sz-copy-btn] button');
+    if (!copyBtn) return;
+    const checkboxes   = Array.from(fieldset.querySelectorAll('input[data-sz-checkbox]'));
+    const checkedCount = checkboxes.filter(cb => cb.checked).length;
+    if (checkedCount === 0)      copyBtn.textContent = '📋 Копировать все зоны';
+    else if (checkedCount === 1) copyBtn.textContent = '📋 Копировать зону';
+    else                         copyBtn.textContent = '📋 Копировать зоны';
+  }
+
+  function getCheckedZoneNames() {
+    const fieldset = document.querySelector('fieldset[data-testid="field-deliveryZones"]');
+    if (!fieldset) return null;
+    const checkboxes = Array.from(fieldset.querySelectorAll('input[data-sz-checkbox]'));
+    const checked = checkboxes.filter(cb => cb.checked).map(cb => cb.getAttribute('data-zone-name'));
+    return checked.length > 0 ? checked : null;
+  }
+
+  async function onCopy() {
+    const projectId = getProjectId();
+    const shopId    = getShopId();
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
+    if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
+    showToast('Копируем зоны...', 'info');
+    try {
+      const doc = await getDoc(projectId, shopId);
+      if (!doc) { showToast('Заведение не найдено', 'error'); return; }
+      const allZones    = doc.deliveryZones || [];
+      const zoneNames   = getCheckedZoneNames();
+      const zonesToCopy = zoneNames ? allZones.filter(z => zoneNames.includes(z.name)) : allZones;
+      if (zonesToCopy.length === 0) { showToast('Нет зон для копирования', 'warning'); return; }
+      clipboard = { zones: zonesToCopy, sourceAddress: getAddress(doc) };
+      showToast(`✅ Скопировано зон: ${zonesToCopy.length}\n` + zonesToCopy.map(z => `• ${z.name}`).join('\n'), 'success');
+    } catch (e) {
+      showToast('Ошибка: ' + e.message, 'error');
+    }
+  }
+
+  async function onPaste() {
+    if (!clipboard) { showToast('Сначала нажмите «Копировать зоны» на заведении-источнике', 'warning'); return; }
+    const projectId = getProjectId();
+    const shopId    = getShopId();
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
+    if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
+    showToast('Вставляем зоны...', 'info');
+    try {
+      const targetDoc = await getDoc(projectId, shopId);
+      if (!targetDoc) { showToast('Целевое заведение не найдено', 'error'); return; }
+      const targetZones = targetDoc.deliveryZones || [];
+      const draftId     = 'drafts.' + shopId;
+      const hasDraft    = targetDoc._id.startsWith('drafts.');
+      const zonesToAdd  = [];
+      const skipped     = [];
+      for (const zone of clipboard.zones) {
+        const newName = `${zone.name} с ${clipboard.sourceAddress}`;
+        if (targetZones.find(z => z.name === newName)) { skipped.push(newName); continue; }
+        const clone = deepClone(zone);
+        clone.name  = newName;
+        zonesToAdd.push(clone);
+      }
+      if (zonesToAdd.length === 0) { showToast('Все выбранные зоны уже есть в этом заведении', 'warning'); return; }
+      const mutations = [];
+      if (!hasDraft) {
+        const { documents } = await (await apiFetch(projectId, `/data/doc/production/${shopId}`)).json();
+        mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+      }
+      mutations.push({
+        patch: {
+          id: draftId,
+          setIfMissing: { deliveryZones: [] },
+          insert: { after: 'deliveryZones[-1]', items: zonesToAdd }
+        }
+      });
+      const r = await apiFetch(projectId, `/data/mutate/production`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mutations })
+      });
+      const result = await r.json();
+      if (r.ok) {
+        let msg = `✅ Вставлено зон: ${zonesToAdd.length}\n` + zonesToAdd.map(z => `• ${z.name}`).join('\n');
+        if (skipped.length) msg += `\n\n⚠️ Пропущено (уже есть): ${skipped.length}`;
+        msg += '\n\nНажмите «Опубликовать» в интерфейсе';
+        showToast(msg, 'success');
+      } else {
+        showToast('Ошибка Sanity: ' + JSON.stringify(result?.error || result), 'error');
+      }
+    } catch (e) {
+      showToast('Ошибка: ' + e.message, 'error');
+    }
+  }
+
+  const PAYMENT_TYPES = [
+    { value: 'card',          label: 'Банковская карта' },
+    { value: 'cash',          label: 'Наличные' },
+    { value: 'cardToCourier', label: 'Картой курьеру' },
+    { value: 'cashToCourier', label: 'Наличными курьеру' },
+    { value: 'sbp',           label: 'СБП' },
+    { value: 'sberpay',       label: 'SberPay' },
+    { value: 'bonus',         label: 'Бонусный счёт' },
+    { value: 'apple',         label: 'Apple Pay' },
+    { value: 'applePayWeb',   label: 'Apple Pay на странице оплаты' },
+    { value: 'google',        label: 'Google Pay' }
+  ];
+
+  function buildPaymentTypesEditor(currentValues) {
+    const wrap = document.createElement('div');
+    wrap.setAttribute('data-sz-payment-types', '1');
+    wrap.style.cssText = 'margin-top:14px;';
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:14px;color:#555;margin-bottom:8px;';
+    title.textContent = 'Типы оплаты';
+    wrap.appendChild(title);
+
+    const grid = document.createElement('div');
+    grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;';
+    const known = new Set(currentValues || []);
+    for (const pt of PAYMENT_TYPES) {
+      const label = document.createElement('label');
+      label.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.setAttribute('data-sz-payment-value', pt.value);
+      cb.checked = known.has(pt.value);
+      cb.style.cssText = 'width:16px;height:16px;cursor:pointer;';
+      const span = document.createElement('span');
+      span.textContent = pt.label;
+      label.appendChild(cb);
+      label.appendChild(span);
+      grid.appendChild(label);
+    }
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  function readPaymentTypes(container) {
+    const wrap = container.querySelector('[data-sz-payment-types]');
+    if (!wrap) return null;
+    const checked = Array.from(wrap.querySelectorAll('input[data-sz-payment-value]'))
+      .filter(cb => cb.checked)
+      .map(cb => cb.getAttribute('data-sz-payment-value'));
+    return checked;
+  }
+
+  function buildGradationEditor(rows, dynamicCalc, defaultCompType) {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'margin-top:6px;';
+    const table = document.createElement('div');
+    table.setAttribute('data-sz-grad-table', '1');
+    table.style.cssText = 'display:flex; flex-direction:column; gap:8px;';
+
+    function renderCompTypeSelect(rawValue) {
+      const known = [
+        { key: '0', raw: 'percent', label: 'В процентах' },
+        { key: '1', raw: 'currency', label: 'В валюте' }
+      ];
+      const rawMap = { '': null };
+      let optionsHtml = '<option value="">- тип -</option>';
+      let matchedKey = '';
+      for (const opt of known) {
+        rawMap[opt.key] = opt.raw;
+        const isMatch = rawValue !== undefined && rawValue !== null && String(rawValue) === String(opt.raw);
+        if (isMatch) matchedKey = opt.key;
+        optionsHtml += '<option value="' + opt.key + '"' + (isMatch ? ' selected' : '') + '>' + opt.label + '</option>';
+      }
+      if (rawValue !== undefined && rawValue !== null && !matchedKey) {
+        rawMap['unknown'] = rawValue;
+        optionsHtml += '<option value="unknown" selected>⚠ текущее значение (' + JSON.stringify(rawValue) + ')</option>';
+        matchedKey = 'unknown';
+      }
+      const encodedMap = JSON.stringify(rawMap).replace(/"/g, '&quot;');
+      return '<select style="padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" ' +
+        'data-sz-grad-comp-type data-sz-raw-map="' + encodedMap + '">' + optionsHtml + '</select>';
+    }
+
+    function addRow(basketPriceTo, price, compType, compValue) {
+      basketPriceTo = basketPriceTo ?? '';
+      price = price ?? '';
+      compValue = compValue ?? '';
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
+      if (dynamicCalc) {
+        row.innerHTML =
+          '<span style="font-size:14px;color:#888;white-space:nowrap;">до &#8381;</span>' +
+          '<input type="number" placeholder="сумма корзины" value="' + basketPriceTo + '" ' +
+            'style="width:130px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-to>' +
+          '<span style="font-size:14px;color:#888;">&rarr;</span>' +
+          renderCompTypeSelect(compType) +
+          '<input type="number" placeholder="значение" value="' + compValue + '" ' +
+            'style="width:110px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-comp-value>' +
+          '<button type="button" style="padding:6px 12px;border:none;background:#e74c3c;color:#fff;border-radius:6px;cursor:pointer;font-size:15px;" data-sz-grad-del>&#10005;</button>';
+      } else {
+        row.innerHTML =
+          '<span style="font-size:14px;color:#888;white-space:nowrap;">до &#8381;</span>' +
+          '<input type="number" placeholder="сумма корзины" value="' + basketPriceTo + '" ' +
+            'style="width:130px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-to>' +
+          '<span style="font-size:14px;color:#888;">&rarr; &#8381;</span>' +
+          '<input type="number" placeholder="цена" value="' + price + '" ' +
+            'style="width:110px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-price>' +
+          '<button type="button" style="padding:6px 12px;border:none;background:#e74c3c;color:#fff;border-radius:6px;cursor:pointer;font-size:15px;" data-sz-grad-del>&#10005;</button>';
+      }
+      row.querySelector('[data-sz-grad-del]').addEventListener('click', () => row.remove());
+      table.appendChild(row);
+    }
+
+    for (const r of rows) {
+      const rowCompType = (r.compensation?.compensationType ?? defaultCompType);
+      addRow(r.basketPriceTo, r.price, rowCompType, r.compensation?.compensationValue);
+    }
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = '+ Добавить ступень';
+    addBtn.style.cssText = 'margin-top:8px;padding:8px 14px;border:1px dashed #4a90e2;background:transparent;color:#4a90e2;border-radius:6px;cursor:pointer;font-size:14px;';
+    addBtn.addEventListener('click', () => addRow(undefined, undefined, defaultCompType, undefined));
+
+    wrap.appendChild(table);
+    wrap.appendChild(addBtn);
+    return wrap;
+  }
+
+  function readGradation(container, dynamicCalc) {
+    const rows = container.querySelectorAll('[data-sz-grad-table] > div');
+    const result = [];
+    for (const row of rows) {
+      const to = parseFloat(row.querySelector('[data-sz-grad-to]')?.value);
+      if (isNaN(to)) continue;
+      if (dynamicCalc) {
+        const typeEl  = row.querySelector('[data-sz-grad-comp-type]');
+        const valueEl = row.querySelector('[data-sz-grad-comp-value]');
+        const selectedKey = typeEl ? typeEl.value : '';
+        const value = parseFloat(valueEl?.value);
+        if (selectedKey === '' || isNaN(value)) continue;
+        let rawMap = {};
+        try { rawMap = JSON.parse(typeEl.getAttribute('data-sz-raw-map') || '{}'); } catch (e) { /* ignore */ }
+        const compensationType = rawMap[selectedKey];
+        result.push({
+          _key: newKey(),
+          _type: 'deliveryPrice',
+          basketPriceTo: to,
+          compensation: { _type: 'compensation', compensationType, compensationValue: value }
+        });
+      } else {
+        const price = parseFloat(row.querySelector('[data-sz-grad-price]')?.value);
+        if (!isNaN(price)) result.push({ _key: newKey(), _type: 'deliveryPrice', basketPriceTo: to, price });
+      }
+    }
+    return result;
+  }
+
+  function buildDeliveryTypeSection(label, dtpData, isCollapsed) {
+    const section = document.createElement('div');
+    section.style.cssText = 'margin-top:10px;';
+    const dynamicCalc  = dtpData?.dynamicCalc === true;
+    const timeFieldName = dynamicCalc ? 'dynamicDeliveryTime' : 'deliveryTime';
+    const priceFieldName = dynamicCalc ? 'defaultDynamicDeliveryPrice' : 'defaultDeliveryPrice';
+    const existingTime = dtpData?.[timeFieldName]  ?? '';
+    const existingMin  = dtpData?.minBasketPrice ?? '';
+    const existingDef  = dtpData?.[priceFieldName] ?? '';
+    const existingGrad = dtpData?.deliveryPrice || [];
+
+    const content = document.createElement('div');
+    content.setAttribute('data-sz-section', label);
+    content.setAttribute('data-sz-dynamic-calc', dynamicCalc ? '1' : '0');
+    content.setAttribute('data-sz-price-field', priceFieldName);
+    content.style.cssText = 'padding:16px;background:#f8f9fa;border-radius:8px;border:1px solid #e0e0e0;';
+    content.innerHTML = `
+      <label style="display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer;background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;padding:8px 12px;margin-bottom:14px;">
+        <input type="checkbox" data-sz-only-payment style="width:16px;height:16px;cursor:pointer;">
+        <span>Изменить только типы оплаты <span style="color:#888;">(время, мин. сумма, цена по умолчанию и градация в каждой зоне останутся как есть)</span></span>
+      </label>
+      <div data-sz-non-payment-fields>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;">
+        <label style="font-size:14px;color:#555;">${dynamicCalc ? 'Время динамической доставки (мин)' : 'Время доставки (мин)'}
+          <input type="number" placeholder="не менять" value="${existingTime}"
+            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+            data-sz-field="${timeFieldName}">
+        </label>
+        <label style="font-size:14px;color:#555;">Мин. сумма корзины
+          <input type="number" placeholder="не менять" value="${existingMin}"
+            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+            data-sz-field="minBasketPrice">
+        </label>
+        <label style="font-size:14px;color:#555;">${dynamicCalc ? 'Цена динамической доставки по умолчанию' : 'Цена по умолчанию'}
+          <input type="number" placeholder="не менять" value="${existingDef}"
+            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+            data-sz-field="${priceFieldName}">
+        </label>
+      </div>
+      ${dynamicCalc ? `
+      <div style="font-size:13px;color:#8e44ad;background:#f4ecfb;border:1px solid #e3d3f5;border-radius:6px;padding:8px 12px;margin-bottom:12px;">
+        ⚡ Активирован динамический расчёт — ступени градации задаются компенсацией (тип и значение), а не фиксированной ценой.
+      </div>` : ''}
+      <div style="font-size:14px;color:#555;margin-bottom:8px;">Градация цен <span style="color:#888;">(пустая таблица = очистить, не трогайте если не нужно менять)</span></div>
+      </div>
+    `;
+    const nonPaymentWrap = content.querySelector('[data-sz-non-payment-fields]');
+    const gradWrap = document.createElement('div');
+    gradWrap.setAttribute('data-sz-grad-wrap', '1');
+    gradWrap.appendChild(buildGradationEditor(existingGrad, dynamicCalc, dtpData?.compensation?.compensationType));
+    nonPaymentWrap.appendChild(gradWrap);
+
+    content.appendChild(buildPaymentTypesEditor(dtpData?.paymentTypes));
+
+    const onlyPaymentCb = content.querySelector('[data-sz-only-payment]');
+    onlyPaymentCb.addEventListener('change', () => {
+      const disabled = onlyPaymentCb.checked;
+      nonPaymentWrap.style.opacity = disabled ? '0.4' : '1';
+      nonPaymentWrap.style.pointerEvents = disabled ? 'none' : 'auto';
+      nonPaymentWrap.querySelectorAll('input, select, button').forEach(el => { el.disabled = disabled; });
+    });
+
+    if (isCollapsed) {
+      const details = document.createElement('details');
+      details.style.cssText = 'margin-top:14px;';
+      const summary = document.createElement('summary');
+      summary.style.cssText = 'cursor:pointer;font-size:16px;font-weight:600;color:#555;user-select:none;padding:4px 0;';
+      summary.textContent = label;
+      details.appendChild(summary);
+      details.appendChild(content);
+      section.appendChild(details);
+    } else {
+      const titleEl = document.createElement('div');
+      titleEl.style.cssText = 'font-size:16px;font-weight:700;color:#333;margin-bottom:8px;';
+      titleEl.textContent = label;
+      section.appendChild(titleEl);
+      section.appendChild(content);
+    }
+    return section;
+  }
+
+  async function onEditConditions() {
+    const projectId = getProjectId();
+    const shopId    = getShopId();
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
+    if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
+    showToast('Загружаем данные...', 'info');
+    let doc, typeNameMap;
+    try {
+      doc = await getDoc(projectId, shopId);
+      if (!doc) { showToast('Заведение не найдено', 'error'); return; }
+      const allRefs = new Set();
+      for (const zone of (doc.deliveryZones || []))
+        for (const dtp of (zone.deliveryTypePrices || []))
+          if (dtp.deliveryType?._ref) allRefs.add(dtp.deliveryType._ref);
+      typeNameMap = await resolveDeliveryTypeNames(projectId, [...allRefs]);
+    } catch (e) {
+      showToast('Ошибка загрузки: ' + e.message, 'error'); return;
+    }
+
+    const zoneNames   = getCheckedZoneNames();
+    const targetZones = zoneNames
+      ? (doc.deliveryZones || []).filter(z => zoneNames.includes(z.name))
+      : (doc.deliveryZones || []);
+    if (targetZones.length === 0) { showToast('Нет зон для редактирования', 'warning'); return; }
+
+    const firstZone = targetZones[0];
+    const dtpByName = {};
+    for (const dtp of (firstZone.deliveryTypePrices || [])) {
+      const name = typeNameMap[dtp.deliveryType?._ref];
+      if (name) dtpByName[name] = dtp;
+    }
+
+    const allTypeNames = [...new Set(Object.values(typeNameMap))].sort((a, b) => {
+      if (a === 'Доставка') return -1;
+      if (b === 'Доставка') return 1;
+      return a.localeCompare(b, 'ru');
+    });
+
+    const overlay = document.createElement('div');
+    overlay.id = 'sz-edit-modal';
+    overlay.style.cssText = `
+      position:fixed;inset:0;z-index:999998;
+      background:rgba(0,0,0,0.45);
+      display:flex;align-items:center;justify-content:center;
+      font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    `;
+    const modal = document.createElement('div');
+    modal.style.cssText = `
+      background:#fff;border-radius:12px;padding:32px;
+      width:760px;max-width:96vw;max-height:90vh;
+      overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.25);
+      position:relative;
+      font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    `;
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:22px;font-weight:700;margin-bottom:6px;';
+    title.textContent = '✏️ Изменить условия доставки';
+    const subtitle = document.createElement('div');
+    subtitle.style.cssText = 'font-size:15px;color:#888;margin-bottom:20px;';
+    subtitle.textContent = `Зоны: ${targetZones.map(z => z.name).join(', ')}`;
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'position:absolute;top:20px;right:22px;background:none;border:none;font-size:24px;cursor:pointer;color:#999;line-height:1;';
+    closeBtn.addEventListener('click', () => overlay.remove());
+
+    modal.appendChild(closeBtn);
+    modal.appendChild(title);
+    modal.appendChild(subtitle);
+
+    for (let i = 0; i < allTypeNames.length; i++) {
+      modal.appendChild(buildDeliveryTypeSection(allTypeNames[i], dtpByName[allTypeNames[i]] || null, allTypeNames[i] !== 'Доставка'));
+    }
+
+    // --- БЛОК МАССОВОГО ПРИМЕНЕНИЯ ---
+    const massApplyWrap = document.createElement('div');
+    massApplyWrap.style.cssText = 'margin-top:22px; padding:16px; background:#f0f7ff; border:1px solid #cce4ff; border-radius:8px;';
+    massApplyWrap.innerHTML = `
+      <label style="display:flex;align-items:center;gap:10px;font-size:15px;color:#333;cursor:pointer;font-weight:600;">
+        <input type="checkbox" id="sz-mass-toggle" style="width:18px;height:18px;accent-color:#4a90e2;">
+        Применить к нескольким ресторанам
+      </label>
+      <div id="sz-mass-content" style="display:none; margin-top:15px; border-top:1px solid #cce4ff; padding-top:15px;">
+        <button id="sz-load-shops-btn" style="padding:10px 14px; border:1px solid #4a90e2; background:#4a90e2; color:#fff; border-radius:6px; cursor:pointer; font-weight:600;">
+          🔄 Загрузить список ресторанов и зон
+        </button>
+        <div style="font-size:13px;color:#888;margin-top:8px;">
+          У каждого ресторана могут быть зоны с разными названиями — раскройте ресторан и отметьте
+          галочками именно те зоны, куда нужно перенести условия.
+        </div>
+        <div id="sz-shops-container" style="display:none; margin-top:15px;"></div>
+      </div>
+    `;
+    modal.appendChild(massApplyWrap);
+
+    const applyBtn = document.createElement('button');
+    applyBtn.textContent = '✅ Применить';
+    applyBtn.style.cssText = `
+      margin-top:22px;width:100%;padding:15px;
+      background:#4a90e2;color:#fff;border:none;border-radius:8px;
+      font-size:16px;font-weight:700;cursor:pointer;
+    `;
+
+    // Логика загрузки двухуровневого списка ресторан → зоны
+    const massToggle = massApplyWrap.querySelector('#sz-mass-toggle');
+    const massContent = massApplyWrap.querySelector('#sz-mass-content');
+    const loadShopsBtn = massApplyWrap.querySelector('#sz-load-shops-btn');
+    const shopsContainer = massApplyWrap.querySelector('#sz-shops-container');
+
+    massToggle.addEventListener('change', () => {
+      massContent.style.display = massToggle.checked ? 'block' : 'none';
+      if (massToggle.checked) loadShopsBtn.click();
+    });
+
+    loadShopsBtn.addEventListener('click', async () => {
+      loadShopsBtn.textContent = '⏳ Загрузка...';
+      loadShopsBtn.disabled = true;
+      try {
+        const shops = await fetchAllShops(projectId);
+        shopsContainer.innerHTML = '';
+        if (shops.length === 0) {
+          shopsContainer.innerHTML = '<div style="color:#888;">Рестораны не найдены</div>';
+        } else {
+          const searchBox = document.createElement('input');
+          searchBox.type = 'text';
+          searchBox.placeholder = 'Поиск по названию ресторана...';
+          searchBox.style.cssText = 'width:100%; padding:8px; margin-bottom:10px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box;';
+          shopsContainer.appendChild(searchBox);
+
+          const globalActions = document.createElement('div');
+          globalActions.style.cssText = 'display:flex; gap:14px; margin-bottom:8px; font-size:13px;';
+          globalActions.innerHTML = `
+            <a href="#" data-sz-expand-all style="color:#4a90e2; text-decoration:none;">Развернуть все</a>
+            <a href="#" data-sz-collapse-all style="color:#4a90e2; text-decoration:none;">Свернуть все</a>
+          `;
+          shopsContainer.appendChild(globalActions);
+
+          const shopsList = document.createElement('div');
+          shopsList.style.cssText = 'max-height:340px; overflow-y:auto; border:1px solid #eee; border-radius:6px; padding:10px;';
+
+          for (const shop of shops) {
+            const zones = shop.zones || [];
+            const shopDetails = document.createElement('details');
+            shopDetails.setAttribute('data-sz-shop-block', shop._id);
+            shopDetails.style.cssText = 'border:1px solid #eee; border-radius:6px; margin-bottom:6px; padding:6px 10px;';
+            shopDetails.dataset.shopName = (shop.name?.ru || '').toLowerCase();
+
+            const summary = document.createElement('summary');
+            summary.style.cssText = 'display:flex; align-items:center; gap:8px; cursor:pointer; list-style:none;';
+
+            const shopAllCb = document.createElement('input');
+            shopAllCb.type = 'checkbox';
+            shopAllCb.setAttribute('data-sz-shop-all', shop._id);
+            shopAllCb.style.cssText = 'width:16px;height:16px;cursor:pointer;flex-shrink:0;';
+            shopAllCb.disabled = zones.length === 0;
+            shopAllCb.addEventListener('click', e => e.stopPropagation());
+
+            const labelSpan = document.createElement('span');
+            const addressStr = `${shop.address?.street?.ru || ''} ${shop.address?.house?.ru || ''}`.trim();
+            labelSpan.textContent = `${shop.name?.ru || shop._id}${addressStr ? ' (' + addressStr + ')' : ''} — ${zones.length} ${zones.length === 1 ? 'зона' : 'зон'}`;
+            labelSpan.style.cssText = zones.length === 0 ? 'color:#bbb;' : '';
+
+            summary.appendChild(shopAllCb);
+            summary.appendChild(labelSpan);
+            shopDetails.appendChild(summary);
+
+            if (zones.length > 0) {
+              const zonesWrap = document.createElement('div');
+              zonesWrap.style.cssText = 'margin-top:8px; padding-left:26px; display:flex; flex-direction:column; gap:5px;';
+
+              for (const zone of zones) {
+                const zLabel = document.createElement('label');
+                zLabel.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:14px; color:#333; cursor:pointer;';
+                const zCb = document.createElement('input');
+                zCb.type = 'checkbox';
+                zCb.setAttribute('data-sz-shop-id', shop._id);
+                zCb.setAttribute('data-sz-zone-key', zone._key);
+                zCb.style.cssText = 'width:15px;height:15px;cursor:pointer;flex-shrink:0;';
+                const zSpan = document.createElement('span');
+                zSpan.textContent = zone.name || '(без названия)';
+                zLabel.appendChild(zCb);
+                zLabel.appendChild(zSpan);
+                zonesWrap.appendChild(zLabel);
+              }
+
+              shopAllCb.addEventListener('change', () => {
+                zonesWrap.querySelectorAll('input[data-sz-zone-key]').forEach(cb => { cb.checked = shopAllCb.checked; });
+              });
+              zonesWrap.addEventListener('change', () => {
+                const all    = zonesWrap.querySelectorAll('input[data-sz-zone-key]');
+                const checked = zonesWrap.querySelectorAll('input[data-sz-zone-key]:checked');
+                shopAllCb.checked       = all.length > 0 && checked.length === all.length;
+                shopAllCb.indeterminate = checked.length > 0 && checked.length < all.length;
+              });
+
+              shopDetails.appendChild(zonesWrap);
+            }
+
+            shopsList.appendChild(shopDetails);
+          }
+
+          shopsContainer.appendChild(shopsList);
+
+          searchBox.addEventListener('input', () => {
+            const term = searchBox.value.toLowerCase();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => {
+              d.style.display = (d.dataset.shopName || '').includes(term) ? '' : 'none';
+            });
+          });
+
+          globalActions.querySelector('[data-sz-expand-all]').addEventListener('click', e => {
+            e.preventDefault();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = true; });
+          });
+          globalActions.querySelector('[data-sz-collapse-all]').addEventListener('click', e => {
+            e.preventDefault();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = false; });
+          });
+        }
+        shopsContainer.style.display = 'block';
+      } catch(e) {
+        showToast('Ошибка загрузки списка: ' + e.message, 'error');
+      } finally {
+        loadShopsBtn.textContent = '🔄 Загрузить список ресторанов и зон';
+        loadShopsBtn.disabled = false;
+      }
+    });
+
+    // Собирает выбор пользователя как карту { shopId: [zoneKey, zoneKey, ...] }
+    function collectSelectedShopZones() {
+      const map = {};
+      shopsContainer.querySelectorAll('input[data-sz-zone-key]:checked').forEach(cb => {
+        const shopId  = cb.getAttribute('data-sz-shop-id');
+        const zoneKey = cb.getAttribute('data-sz-zone-key');
+        (map[shopId] ||= []).push(zoneKey);
+      });
+      return map;
+    }
+
+    applyBtn.addEventListener('click', () => {
+      const isMassApply = massToggle.checked;
+      let selectedShopZones = {};
+      if (isMassApply) {
+        selectedShopZones = collectSelectedShopZones();
+        if (Object.keys(selectedShopZones).length === 0) {
+          showToast('Отметьте хотя бы одну зону хотя бы в одном ресторане для массового применения', 'warning');
+          return;
+        }
+      }
+      applyConditions(overlay, modal, projectId, shopId, doc, targetZones, typeNameMap, allTypeNames, isMassApply, selectedShopZones);
+    });
+
+    modal.appendChild(applyBtn);
+    overlay.appendChild(modal);
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
+  function gradRowValue(row, dynamicCalc) {
+    if (!row) return 0;
+    const v = dynamicCalc ? row.compensation?.compensationValue : row.price;
+    return (typeof v === 'number' && !isNaN(v)) ? v : 0;
+  }
+
+  function gradRowsToMap(rows, dynamicCalc) {
+    const map = {};
+    for (const r of (rows || [])) {
+      if (r?.basketPriceTo === undefined || r?.basketPriceTo === null) continue;
+      map[r.basketPriceTo] = gradRowValue(r, dynamicCalc);
+    }
+    return map;
+  }
+
+  function collectPriceWarnings(zoneName, typeName, dtp, change, priceFieldName, dynamicCalc) {
+    const warnings = [];
+    const oldDefault = (typeof dtp?.[priceFieldName] === 'number') ? dtp[priceFieldName] : 0;
+    const newDefault = (priceFieldName in change) ? change[priceFieldName] : oldDefault;
+    if (newDefault !== oldDefault && (newDefault > 0 || oldDefault > 0)) {
+      warnings.push(`${zoneName} — ${typeName}: цена ${oldDefault}₽ → ${newDefault}₽`);
+    }
+    const oldGradMap = gradRowsToMap(dtp?.deliveryPrice, dynamicCalc);
+    const newGradMap = ('deliveryPrice' in change) ? gradRowsToMap(change.deliveryPrice, dynamicCalc) : oldGradMap;
+    const allKeys = new Set([...Object.keys(oldGradMap), ...Object.keys(newGradMap)]);
+    for (const key of allKeys) {
+      const oldVal = oldGradMap[key] ?? 0;
+      const newVal = newGradMap[key] ?? 0;
+      if (oldVal !== newVal && (newVal > 0 || oldVal > 0)) {
+        warnings.push(`${zoneName} — ${typeName}: ступень до ${key}₽: ${oldVal} → ${newVal}`);
+      }
+    }
+    return warnings;
+  }
+
+  async function applyConditions(overlay, modal, projectId, currentShopId, currentDoc, currentTargetZones, currentTypeNameMap, allTypeNames, isMassApply, selectedShopZones) {
+    const changes  = {};
+    const typeMeta = {};
+    for (const typeName of allTypeNames) {
+      const section = modal.querySelector(`[data-sz-section="${typeName}"]`);
+      if (!section) continue;
+      const dynamicCalc    = section.getAttribute('data-sz-dynamic-calc') === '1';
+      const priceFieldName = section.getAttribute('data-sz-price-field') || 'defaultDeliveryPrice';
+      typeMeta[typeName] = { dynamicCalc, priceFieldName };
+
+      const onlyPayment = section.querySelector('[data-sz-only-payment]')?.checked === true;
+
+      const entry = {};
+      if (!onlyPayment) {
+        section.querySelectorAll('[data-sz-field]').forEach(input => {
+          const fieldName = input.getAttribute('data-sz-field');
+          const val = input.value.trim();
+          if (val !== '') entry[fieldName] = parseFloat(val);
+        });
+        const gradWrap = section.querySelector('[data-sz-grad-wrap]');
+        if (gradWrap) entry.deliveryPrice = readGradation(gradWrap, dynamicCalc);
+      }
+      const paymentTypes = readPaymentTypes(section);
+      if (paymentTypes) entry.paymentTypes = paymentTypes;
+      if (Object.keys(entry).length > 0) changes[typeName] = entry;
+    }
+    if (Object.keys(changes).length === 0) { showToast('Нет изменений для применения', 'warning'); return; }
+
+    overlay.remove();
+
+    // Одиночное применение (оригинальный функционал, без изменений)
+    if (!isMassApply) {
+      showToast('Применяем изменения...', 'info');
+      try {
+        const draftId  = 'drafts.' + currentShopId;
+        const hasDraft = currentDoc._id.startsWith('drafts.');
+        const mutations = [];
+        if (!hasDraft) {
+          const { documents } = await (await apiFetch(projectId, `/data/doc/production/${currentShopId}`)).json();
+          mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+        }
+
+        const priceWarnings = [];
+        for (const zone of currentTargetZones) {
+          for (const dtp of (zone.deliveryTypePrices || [])) {
+            const typeName = currentTypeNameMap[dtp.deliveryType?._ref];
+            const change   = changes[typeName];
+            if (!change) continue;
+            const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
+            const setFields = {};
+            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
+            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+
+            const meta = typeMeta[typeName];
+            if (meta) priceWarnings.push(...collectPriceWarnings(zone.name, typeName, dtp, change, meta.priceFieldName, meta.dynamicCalc));
+          }
+        }
+
+        if (mutations.length === 0) { showToast('Не найдены совпадающие типы доставки в зонах', 'warning'); return; }
+
+        const r = await apiFetch(projectId, `/data/mutate/production`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mutations })
+        });
+        const result = await r.json();
+        if (r.ok) {
+          let msg = `✅ Условия обновлены в ${currentTargetZones.length} зон(ах):\n` + Object.keys(changes).map(t => `• ${t}`).join('\n') + '\n\nНажмите «Опубликовать»';
+          let type = 'success';
+          if (priceWarnings.length > 0) {
+            msg += '\n\n⚠️ Проверьте «Позицию для доставки»:\n' + priceWarnings.map(w => `• ${w}`).join('\n');
+            type = 'warning';
+          }
+          showToast(msg, type, priceWarnings.length > 0 ? 12000 : 5000);
+        } else {
+          showToast('Ошибка Sanity: ' + JSON.stringify(result?.error || result), 'error');
+        }
+      } catch (e) {
+        showToast('Ошибка: ' + e.message, 'error');
+      }
+      return;
+    }
+
+    // --- МАССОВОЕ ПРИМЕНЕНИЕ (по явно выбранным зонам в каждом ресторане) ---
+    const shopIds = Object.keys(selectedShopZones);
+    let progress = 0;
+    const total = shopIds.length;
+    const allWarnings = [];
+
+    for (const shopId of shopIds) {
+      progress++;
+      showToast(`Массовое обновление: ${progress} из ${total}...`, 'info', 2000);
+      const zoneKeys = selectedShopZones[shopId] || [];
+      if (zoneKeys.length === 0) continue;
+      try {
+        const doc = await getDoc(projectId, shopId);
+        if (!doc) { allWarnings.push(`${shopId}: заведение не найдено.`); continue; }
+
+        const allRefs = new Set();
+        for (const zone of (doc.deliveryZones || []))
+          for (const dtp of (zone.deliveryTypePrices || []))
+            if (dtp.deliveryType?._ref) allRefs.add(dtp.deliveryType._ref);
+        const typeNameMap = await resolveDeliveryTypeNames(projectId, [...allRefs]);
+
+        // Матчим зоны по _key, а не по имени — так надёжно работает,
+        // даже если в ресторане другое число зон или другие названия.
+        const targetZones = (doc.deliveryZones || []).filter(z => zoneKeys.includes(z._key));
+        if (targetZones.length === 0) {
+          allWarnings.push(`${doc.name?.ru || shopId}: выбранные зоны не найдены (возможно, были изменены после загрузки списка — обновите список и попробуйте снова).`);
+          continue;
+        }
+
+        const draftId = 'drafts.' + shopId;
+        const hasDraft = doc._id.startsWith('drafts.');
+        const mutations = [];
+
+        if (!hasDraft) {
+          const { documents } = await (await apiFetch(projectId, `/data/doc/production/${shopId}`)).json();
+          mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+        }
+
+        const appliedTypes = new Set();
+
+        for (const zone of targetZones) {
+          for (const dtp of (zone.deliveryTypePrices || [])) {
+            const typeName = typeNameMap[dtp.deliveryType?._ref];
+            const change = changes[typeName];
+            if (!change) continue;
+
+            appliedTypes.add(typeName);
+            const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
+            const setFields = {};
+            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
+
+            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+          }
+        }
+
+        for (const typeName of Object.keys(changes)) {
+          if (!appliedTypes.has(typeName)) {
+            allWarnings.push(`${doc.name?.ru || shopId}: в выбранных зонах нет типа "${typeName}"`);
+          }
+        }
+
+        if (mutations.length > 0) {
+          const r = await apiFetch(projectId, `/data/mutate/production`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mutations })
+          });
+          if (!r.ok) {
+            const result = await r.json();
+            allWarnings.push(`${doc.name?.ru || shopId}: ошибка Sanity - ${JSON.stringify(result?.error)}`);
+          }
+        }
+      } catch(e) {
+        allWarnings.push(`${shopId}: ${e.message}`);
+      }
+      // Задержка 300мс для стабильности API
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    let msg = `✅ Массовое обновление завершено (${total} ресторанов).\nНажмите «Опубликовать» в интерфейсах обновленных ресторанов.`;
+    if (allWarnings.length > 0) {
+      msg += `\n\n⚠️ Предупреждения (${allWarnings.length}):\n` + allWarnings.slice(0, 30).join('\n');
+      if (allWarnings.length > 30) msg += `\n...и еще ${allWarnings.length - 30}`;
+      showToast(msg, 'warning', 15000);
+    } else {
+      showToast(msg, 'success', 8000);
+    }
+  }
+
+  function createButton(text, color, onClick) {
+    const btn = document.createElement('button');
+    btn.textContent = text;
+    btn.style.cssText = `
+      flex:1; padding:10px 14px; background:${color}; color:#fff;
+      border:none; border-radius:6px; font-size:13px; font-weight:600;
+      cursor:pointer; transition:opacity 0.2s; white-space:nowrap;
+    `;
+    btn.addEventListener('mouseenter', () => btn.style.opacity = '0.85');
+    btn.addEventListener('mouseleave', () => btn.style.opacity = '1');
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  function addCheckboxToZoneItem(preview) {
+    let flex = preview;
+    for (let i = 0; i < 4; i++) flex = flex.parentElement;
+    if (!flex || flex.getAttribute('data-ui') !== 'Flex') return;
+    if (flex.getAttribute('data-sz-zone') === 'marked') return;
+    const header   = preview.querySelector('[data-testid="default-preview__header"]');
+    const zoneName = header?.querySelector('span')?.textContent.trim() || '';
+    if (!zoneName) return;
+    const rightFlex = flex.children[2];
+    if (!rightFlex) return;
+    const label = document.createElement('label');
+    label.title = 'Выбрать для копирования / редактирования';
+    label.style.cssText = 'display:flex; align-items:center; cursor:pointer; padding:0 6px;';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.setAttribute('data-sz-checkbox', 'true');
+    cb.setAttribute('data-zone-name', zoneName);
+    cb.style.cssText = 'width:16px; height:16px; cursor:pointer; accent-color:#4a90e2; flex-shrink:0;';
+    cb.addEventListener('click', e => e.stopPropagation());
+    cb.addEventListener('change', updateCopyButtonLabel);
+    label.appendChild(cb);
+    rightFlex.insertBefore(label, rightFlex.firstChild);
+    flex.setAttribute('data-sz-zone', 'marked');
+  }
+
+  function inject() {
+    if (isInjecting) return;
+    const activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
+    if (activeTab?.textContent.trim() !== 'Доставка') return;
+    const fieldset = document.querySelector('fieldset[data-testid="field-deliveryZones"]');
+    if (!fieldset) return;
+    const previews   = fieldset.querySelectorAll('[data-testid="default-preview"]');
+    const hasButtons = !!fieldset.querySelector('[data-sz-wrapper]');
+    const allHaveCb  = Array.from(previews).every(p => {
+      let flex = p;
+      for (let i = 0; i < 4; i++) flex = flex.parentElement;
+      return flex?.getAttribute('data-sz-zone') === 'marked';
+    });
+    if (hasButtons && allHaveCb) return;
+    isInjecting = true;
+    observer.disconnect();
+    try {
+      previews.forEach(p => addCheckboxToZoneItem(p));
+      if (!hasButtons) {
+        const addBtn = fieldset.querySelector('button[data-testid="add-single-object-button"]');
+        if (addBtn) {
+          const stack = addBtn.parentElement?.parentElement;
+          if (stack) {
+            fieldset.querySelector('[data-sz-btn]')?.remove();
+            const wrapper = document.createElement('div');
+            wrapper.setAttribute('data-sz-btn', 'true');
+            wrapper.setAttribute('data-sz-wrapper', 'true');
+            wrapper.style.cssText = 'margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;';
+            const copyWrap = document.createElement('span');
+            copyWrap.setAttribute('data-sz-copy-btn', 'true');
+            copyWrap.style.cssText = 'flex:1;display:flex;';
+            copyWrap.appendChild(createButton('📋 Копировать все зоны', '#4a90e2', onCopy));
+            wrapper.appendChild(copyWrap);
+            wrapper.appendChild(createButton('📌 Вставить зоны', '#27ae60', onPaste));
+            wrapper.appendChild(createButton('✏️ Условия',       '#8e44ad', onEditConditions));
+            stack.appendChild(wrapper);
+          }
+        }
+      }
+    } finally {
+      isInjecting = false;
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
+  let debounceTimer = null;
+  const observer = new MutationObserver(() => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(inject, 150);
+  });
+
+  function startObserving() {
+    observer.observe(document.body, { childList: true, subtree: true });
+    inject();
+  }
+
+  if (document.body) {
+    startObserving();
+  } else {
+    document.addEventListener('DOMContentLoaded', startObserving, { once: true });
+  }
+
+})();
