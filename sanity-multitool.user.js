@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Sanity — мультитул по зонам
+// @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      3.10
-// @description  Чекбоксы, копирование/вставка зон, массовое редактирование условий доставки (+ динамический расчёт/компенсация, типы оплаты с режимом "только оплата", предупреждения о доставочном блюде)
+// @version      6.10
+// @description  Чекбоксы, копирование/вставка зон, точечный выбор условий, JSON-бэкап перед изменением, массовое применение (опасная зона с доп. подтверждением "Точно?") с выбором зон, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
 // @run-at       document-start
@@ -18,28 +18,8 @@
 
   // ---------------------------------------------------------------------
   // Определение Project ID.
-  //
-  // Основной источник — лог "SANITY PROJECT ID >>>>>>>>>>>>>> <id>",
-  // который печатается один раз при загрузке конфига workspace. Чтобы его
-  // гарантированно поймать, перехватываем console.log ещё до того, как
-  // Studio успевает что-либо вывести (@run-at document-start).
-  //
-  // Значение кешируется на всю жизнь вкладки: при переходе между
-  // заведениями внутри одного workspace (SPA-роутинг, без полной
-  // перезагрузки) лог повторно не печатается, поэтому искать его заново
-  // при каждом клике не нужно и не получится.
-  //
-  // Фолбэк — перехват реальных запросов к *.api.sanity.io. Он срабатывает,
-  // если по какой-то причине лог не был пойман (например, скрипт
-  // подключился уже после загрузки страницы), и заодно подстраховывает на
-  // случай, если формат дебаг-лога когда-нибудь изменится или его уберут.
   // ---------------------------------------------------------------------
-
   let cachedProjectId = null;
-  // Workspace (первый сегмент пути), для которого был получен cachedProjectId.
-  // Нужен, чтобы отличить "id ещё не пришёл" от "id устарел после смены
-  // workspace" — во втором случае отдавать старое значение опасно, можно
-  // записать зону в чужой проект.
   let cachedWorkspace = null;
 
   const PROJECT_ID_LOG_RE = /SANITY PROJECT ID[\s>:=-]*([a-z0-9]{6,})/i;
@@ -55,22 +35,14 @@
   }
 
   function tryCaptureFromArgs(args) {
-    // Лог может печататься как одной строкой, так и несколькими отдельными
-    // аргументами (например: console.log('SANITY PROJECT ID', '>>>>', id)) —
-    // склеиваем всё в одну строку, чтобы регэксп ловил оба варианта.
     const combined = args
       .filter(a => typeof a === 'string' || typeof a === 'number')
       .join(' ');
     if (!combined.includes('SANITY PROJECT ID')) return;
     const m = combined.match(PROJECT_ID_LOG_RE);
     if (m) {
-      // Всегда перезаписываем: при переключении workspace через SPA-роутинг
-      // (без перезагрузки страницы) появится новый лог с новым id, и он
-      // должен вытеснить старый, а не быть проигнорированным.
       setCachedProjectId(m[1]);
     } else {
-      // Формат лога отличается от ожидаемого — не падаем молча, оставляем
-      // подсказку в консоли, чтобы можно было быстро поправить регэксп.
       origConsoleWarn('[SZ] Нашёл "SANITY PROJECT ID" в логе, но не смог извлечь id из:', combined);
     }
   }
@@ -93,21 +65,8 @@
 
   function getProjectId() {
     const ws = currentWorkspace();
-
-    // Кеш валиден только для того workspace, для которого он был получен.
     if (cachedProjectId && cachedWorkspace === ws) return cachedProjectId;
-
-    // Кеш есть, но для другого workspace — значит, переход только что
-    // произошёл, а свежий лог/запрос ещё не долетели. Отдавать старое
-    // значение нельзя (можно записать данные в чужой проект), поэтому ждём
-    // следующего console.log/fetch — они наступят практически сразу, как
-    // только Studio догрузит конфиг нового workspace.
     if (cachedProjectId && cachedWorkspace !== ws) return null;
-
-    // Кеша ещё не было вообще (самая первая загрузка страницы, до того как
-    // прошёл первый console.log/fetch) — в этом единственном случае можно
-    // подстраховаться буфером resource timing, он на этот момент относится
-    // ровно к текущему workspace.
     const entries = performance.getEntriesByType('resource').map(e => e.name);
     const entry = entries.find(n => n.includes('.api.sanity.io'));
     const fromPerf = entry?.match(/^https?:\/\/([a-z0-9]+)\.api\.sanity\.io/)?.[1] || null;
@@ -156,6 +115,22 @@
     return documents.find(d => d._id === `drafts.${id}`) || documents.find(d => d._id === id) || null;
   }
 
+  // Запрос списка всех актуальных ресторанов текущего workspace (исключая архив),
+  // вместе с их зонами доставки (_key + name), нужен для двухуровневого каталога
+  // в массовом применении условий.
+  async function fetchAllShops(projectId) {
+    const query = encodeURIComponent(
+      `*[_type == "shop" && !(_id in path("drafts.**")) && isArchived != true] | order(name.ru asc) {
+        _id, name, address,
+        "zones": deliveryZones[]{_key, name}
+      }`
+    );
+    const r = await apiFetch(projectId, `/data/query/production?query=${query}`);
+    if (!r.ok) throw new Error("Не удалось загрузить список ресторанов");
+    const { result } = await r.json();
+    return result;
+  }
+
   async function resolveDeliveryTypeNames(projectId, refs) {
     if (!refs.length) return {};
     const r = await apiFetch(projectId, `/data/doc/production/${refs.join(',')}`);
@@ -165,6 +140,124 @@
     return map;
   }
 
+  // Публикует черновик заведения: копирует содержимое drafts.{id} в опубликованный
+  // документ {id} и удаляет черновик — то же самое, что кнопка «Опубликовать» в интерфейсе.
+  // Если черновика нет (значит уже опубликовано/нет несохранённых правок) — просто выходим.
+  // ---------------------------------------------------------------------
+  // Отслеживание "своих" черновиков: после каждого успешного патча запоминаем
+  // ревизию (_rev), которую сам оставил скрипт. Если при следующем запуске
+  // ревизия черновика совпадает с сохранённой — значит, с момента нашего
+  // последнего касания никто больше документ не трогал, и накопленные
+  // изменения безопасно публиковать. Если ревизия другая (или записи нет) —
+  // считаем черновик потенциально содержащим посторонние правки.
+  // ---------------------------------------------------------------------
+  function ownedDraftKey(projectId, shopId) {
+    return `sz-owned-draft:${projectId}:${shopId}`;
+  }
+  function getOwnedDraftRev(projectId, shopId) {
+    try {
+      const raw = localStorage.getItem(ownedDraftKey(projectId, shopId));
+      return raw ? (JSON.parse(raw)?.rev || null) : null;
+    } catch (e) { return null; }
+  }
+  function setOwnedDraftRev(projectId, shopId, rev) {
+    if (!rev) return;
+    try { localStorage.setItem(ownedDraftKey(projectId, shopId), JSON.stringify({ rev, ts: Date.now() })); }
+    catch (e) { /* localStorage недоступен/переполнен — не критично */ }
+  }
+  function clearOwnedDraftRev(projectId, shopId) {
+    try { localStorage.removeItem(ownedDraftKey(projectId, shopId)); } catch (e) { /* ignore */ }
+  }
+
+  // Резервная узкая проверка перед публикацией — только для МАССОВОГО применения,
+  // где нет доступа к отрисованной странице других ресторанов и, соответственно,
+  // к результату валидации самой Studio. Ловит только то, что подтверждено на
+  // практике (отсутствие города) — НЕ полноценная валидация и заведомо не покрывает
+  // прочие кастомные правила схемы. Для одиночного применения используется
+  // hasStudioValidationError() — она гораздо надёжнее, так как читает уже готовый
+  // результат валидации, посчитанный самой Studio.
+  function getKnownValidationBlockers(doc) {
+    const blockers = [];
+    if (!doc?.address?.cityRef?._ref) blockers.push('не выбран город (Адрес → Город)');
+    return blockers;
+  }
+
+  // Проверяет, показывает ли САМА Studio ошибку валидации для документа,
+  // который сейчас открыт на странице (кнопка "Валидация" в шапке документа
+  // существует в DOM только когда есть хотя бы одна ошибка валидации любого
+  // рода — какие бы кастомные правила ни были в схеме, achievable без
+  // необходимости знать их заранее). Работает только для текущего открытого
+  // документа — у других документов (не отрисованных на странице) этой
+  // информации получить нельзя.
+  function hasStudioValidationError() {
+    const btn = document.querySelector('button[aria-label="Валидация"]');
+    return !!btn?.querySelector('[data-sanity-icon="error-outline"]');
+  }
+
+  // Переключает Studio на документ ресторана через её собственный SPA-роутер
+  // (pushState + popstate), НЕ перезагружая страницу — скрипт и все его переменные
+  // остаются живы. Ждёт, пока URL и панель валидации реально обновятся.
+  async function navigateToShopSpa(workspace, shopId, timeoutMs = 6000) {
+    const targetPath = `/${workspace}/structure/shops-item;shops;${shopId}`;
+    history.pushState({}, '', targetPath);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, 250));
+      if (location.pathname.includes(shopId)) break;
+    }
+    // доп. пауза, чтобы Studio успела пересчитать и отрисовать валидацию для нового документа
+    await new Promise(r => setTimeout(r, 700));
+  }
+
+  // Предполётная проверка перед массовой публикацией: по очереди открывает каждый
+  // выбранный ресторан через SPA-навигацию и читает у Studio реальный результат
+  // валидации (какие бы кастомные правила ни были в схеме). В конце возвращает
+  // Studio туда, откуда начали. Возвращает список ресторанов, не прошедших валидацию.
+  async function checkShopsValidationBeforePublish(workspace, shopIds, originalPath, showProgress) {
+    const invalidShops = [];
+    for (let i = 0; i < shopIds.length; i++) {
+      const shopId = shopIds[i];
+      if (showProgress) showToast(`Проверка валидации: ${i + 1} из ${shopIds.length}...`, 'info', 2000);
+      await navigateToShopSpa(workspace, shopId);
+      if (hasStudioValidationError()) {
+        const shopName = document.querySelector('h1')?.textContent?.trim() || shopId;
+        invalidShops.push({ shopId, shopName });
+      }
+    }
+    await navigateToShopSpa(workspace, originalPath.match(/shops;([a-f0-9-]{36})/)?.[1] || '');
+    return invalidShops;
+  }
+
+  async function publishDoc(projectId, shopId) {
+    const draftId = 'drafts.' + shopId;
+    const { documents } = await (await apiFetch(projectId, `/data/doc/production/${draftId}`)).json();
+    const draftDoc = documents?.[0];
+    if (!draftDoc) return false;
+
+    const blockers = getKnownValidationBlockers(draftDoc);
+    if (blockers.length > 0) {
+      throw new Error('не пройдена валидация — ' + blockers.join('; ') + '. Исправьте вручную в интерфейсе и опубликуйте оттуда.');
+    }
+
+    const publishedDoc = { ...draftDoc, _id: shopId };
+    delete publishedDoc._rev;
+    const mutations = [
+      { createOrReplace: publishedDoc },
+      { delete: { id: draftId } }
+    ];
+    const r = await apiFetch(projectId, `/data/mutate/production`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mutations })
+    });
+    if (!r.ok) {
+      const result = await r.json();
+      throw new Error('публикация не удалась: ' + JSON.stringify(result?.error || result));
+    }
+    return true;
+  }
+
   function getAddress(doc) {
     const street = doc.address?.street?.ru || '';
     const house  = doc.address?.house?.ru  || '';
@@ -172,18 +265,95 @@
     return street || doc.name?.ru || doc._id;
   }
 
+  // Формирует имя файла бэкапа с меткой времени: prefix_2026-08-11_14-32-07.json
+  function backupFilename(prefix) {
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+    const safePrefix = String(prefix).replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
+    return `${safePrefix}_${stamp}.json`;
+  }
+
+  // Скачивает объект как .json файл через скрытую ссылку — без сервера, чисто в браузере
+  function downloadJson(filename, data) {
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+    } catch (e) {
+      showToast('Не удалось сохранить бэкап: ' + e.message, 'error');
+    }
+  }
+
+  // Доп. подтверждение перед массовым применением — легко ошибиться, задев сразу
+  // много ресторанов, а откат из бэкапа небыстрый. "Нет" просто закрывает окно
+  // подтверждения и возвращает к прежним настройкам в модалке — ничего не сбрасывается.
+  function showMassApplyConfirm(shopsCount, onConfirm) {
+    const confirmOverlay = document.createElement('div');
+    confirmOverlay.style.cssText = `
+      position:fixed;inset:0;z-index:9999999;
+      background:rgba(0,0,0,0.55);
+      display:flex;align-items:center;justify-content:center;
+      font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    `;
+    const box = document.createElement('div');
+    box.style.cssText = `
+      background:#fff;border-radius:12px;padding:28px;
+      width:420px;max-width:90vw;
+      box-shadow:0 10px 40px rgba(0,0,0,0.35);
+      text-align:center;
+    `;
+    const shopsLabel = shopsCount != null ? `${shopsCount} ${shopsCount === 1 ? 'ресторан' : 'ресторанов'}` : 'несколько ресторанов';
+    box.innerHTML = `
+      <div style="font-size:38px;margin-bottom:8px;">⚠️</div>
+      <div style="font-size:19px;font-weight:700;color:#333;margin-bottom:10px;">Точно?</div>
+      <div style="font-size:14px;color:#666;margin-bottom:24px;line-height:1.55;">
+        Изменения применятся сразу к ${shopsLabel}. Это действие нельзя откатить одним кликом —
+        восстановление из бэкапа придётся делать вручную. Проверьте ещё раз список
+        ресторанов и зон перед тем, как продолжить.
+      </div>
+      <div style="display:flex; gap:12px;">
+        <button id="sz-confirm-no" style="flex:1;padding:12px;border:1px solid #ccc;background:#fff;color:#333;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">Нет, вернуться</button>
+        <button id="sz-confirm-yes" style="flex:1;padding:12px;border:none;background:#d64236;color:#fff;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;">Да, применить</button>
+      </div>
+    `;
+    confirmOverlay.appendChild(box);
+    document.body.appendChild(confirmOverlay);
+
+    box.querySelector('#sz-confirm-no').addEventListener('click', () => confirmOverlay.remove());
+    box.querySelector('#sz-confirm-yes').addEventListener('click', () => {
+      confirmOverlay.remove();
+      onConfirm();
+    });
+    confirmOverlay.addEventListener('click', e => { if (e.target === confirmOverlay) confirmOverlay.remove(); });
+  }
+
   function showToast(message, type = 'info', duration = 5000) {
     const existing = document.getElementById('sz-toast');
     if (existing) existing.remove();
-    const colors = { info: '#4a90e2', success: '#27ae60', error: '#e74c3c', warning: '#f39c12' };
+    const palette = {
+      info:    { bg: '#eaf2fd', border: '#2f6fd1', text: '#173963' },
+      success: { bg: '#eafaf1', border: '#1f9d55', text: '#0f4a28' },
+      error:   { bg: '#fdecea', border: '#d64236', text: '#7a201a' },
+      warning: { bg: '#fff6e0', border: '#e0900a', text: '#6b4600' }
+    };
+    const c = palette[type] || palette.info;
     const toast = document.createElement('div');
     toast.id = 'sz-toast';
     toast.style.cssText = `
       position:fixed; bottom:24px; right:24px; z-index:999999;
-      background:${colors[type]}; color:#fff;
-      padding:12px 18px; border-radius:8px; font-size:14px;
-      box-shadow:0 4px 12px rgba(0,0,0,0.2); max-width:420px; max-height:70vh; overflow-y:auto;
-      line-height:1.5; white-space:pre-line; transition:opacity 0.3s;
+      background:${c.bg}; color:${c.text};
+      border-left:5px solid ${c.border};
+      padding:14px 20px; border-radius:8px; font-size:14px; font-weight:500;
+      box-shadow:0 6px 20px rgba(0,0,0,0.18); max-width:440px; max-height:70vh; overflow-y:auto;
+      line-height:1.6; white-space:pre-line; transition:opacity 0.3s;
+      font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     `;
     toast.textContent = message;
     document.body.appendChild(toast);
@@ -213,7 +383,7 @@
   async function onCopy() {
     const projectId = getProjectId();
     const shopId    = getShopId();
-    if (!projectId) { showToast('Не удалось определить Project ID. Если вы только что переключили заведение из другого проекта — подождите секунду и повторите. Если не помогает — обновите страницу.', 'error'); return; }
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
     if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
     showToast('Копируем зоны...', 'info');
     try {
@@ -234,7 +404,7 @@
     if (!clipboard) { showToast('Сначала нажмите «Копировать зоны» на заведении-источнике', 'warning'); return; }
     const projectId = getProjectId();
     const shopId    = getShopId();
-    if (!projectId) { showToast('Не удалось определить Project ID. Если вы только что переключили заведение из другого проекта — подождите секунду и повторите. Если не помогает — обновите страницу.', 'error'); return; }
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
     if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
     showToast('Вставляем зоны...', 'info');
     try {
@@ -284,9 +454,6 @@
     }
   }
 
-  // Типы оплаты: соответствие подписи из Sanity Studio и реального строкового
-  // значения, которое лежит в документе (поле deliveryTypePrices[].paymentTypes).
-  // Проверено вживую через API на реальном заведении.
   const PAYMENT_TYPES = [
     { value: 'card',          label: 'Банковская карта' },
     { value: 'cash',          label: 'Наличные' },
@@ -304,9 +471,9 @@
     const wrap = document.createElement('div');
     wrap.setAttribute('data-sz-payment-types', '1');
     wrap.style.cssText = 'margin-top:14px;';
-    const title = document.createElement('div');
-    title.style.cssText = 'font-size:14px;color:#555;margin-bottom:8px;';
-    title.textContent = 'Типы оплаты';
+    const title = document.createElement('label');
+    title.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#555;margin-bottom:8px;cursor:pointer;';
+    title.innerHTML = '<input type="checkbox" data-sz-include-payment style="width:15px;height:15px;cursor:pointer;"> Типы оплаты';
     wrap.appendChild(title);
 
     const grid = document.createElement('div');
@@ -339,7 +506,7 @@
     return checked;
   }
 
-    function buildGradationEditor(rows, dynamicCalc, defaultCompType) {
+  function buildGradationEditor(rows, dynamicCalc, defaultCompType) {
     const wrap = document.createElement('div');
     wrap.style.cssText = 'margin-top:6px;';
     const table = document.createElement('div');
@@ -347,10 +514,6 @@
     table.style.cssText = 'display:flex; flex-direction:column; gap:8px;';
 
     function renderCompTypeSelect(rawValue) {
-      // Известные варианты, которые видно в нативном селекте Sanity.
-      // Если реальное сырое значение не похоже ни на одно из них — сохраняем
-      // его as-is третьим (скрытым) пунктом, чтобы при "Применить" не затереть
-      // существующие данные незнакомым форматом.
       const known = [
         { key: '0', raw: 'percent', label: 'В процентах' },
         { key: '1', raw: 'currency', label: 'В валюте' }
@@ -365,7 +528,6 @@
         optionsHtml += '<option value="' + opt.key + '"' + (isMatch ? ' selected' : '') + '>' + opt.label + '</option>';
       }
       if (rawValue !== undefined && rawValue !== null && !matchedKey) {
-        console.warn('[SZ] Неизвестное сырое значение compensationType — сообщи об этом:', rawValue, typeof rawValue);
         rawMap['unknown'] = rawValue;
         optionsHtml += '<option value="unknown" selected>⚠ текущее значение (' + JSON.stringify(rawValue) + ')</option>';
         matchedKey = 'unknown';
@@ -407,7 +569,6 @@
 
     for (const r of rows) {
       const rowCompType = (r.compensation?.compensationType ?? defaultCompType);
-      if (dynamicCalc) console.log('[SZ] шаг градации, сырое значение compensationType:', r.compensation?.compensationType, '(если пусто — унаследовано с уровня типа доставки:', defaultCompType, ')');
       addRow(r.basketPriceTo, r.price, rowCompType, r.compensation?.compensationValue);
     }
 
@@ -461,9 +622,6 @@
     const existingMin  = dtpData?.minBasketPrice ?? '';
     const existingDef  = dtpData?.[priceFieldName] ?? '';
     const existingGrad = dtpData?.deliveryPrice || [];
-    if (dynamicCalc) {
-      console.log('[SZ] тип "' + label + '", сырое значение compensation.compensationType на уровне типа:', dtpData?.compensation?.compensationType, '(typeof: ' + typeof dtpData?.compensation?.compensationType + ')');
-    }
 
     const content = document.createElement('div');
     content.setAttribute('data-sz-section', label);
@@ -471,25 +629,39 @@
     content.setAttribute('data-sz-price-field', priceFieldName);
     content.style.cssText = 'padding:16px;background:#f8f9fa;border-radius:8px;border:1px solid #e0e0e0;';
     content.innerHTML = `
-      <label style="display:flex;align-items:center;gap:8px;font-size:14px;color:#333;cursor:pointer;background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;padding:8px 12px;margin-bottom:14px;">
-        <input type="checkbox" data-sz-only-payment style="width:16px;height:16px;cursor:pointer;">
-        <span>Изменить только типы оплаты <span style="color:#888;">(время, мин. сумма, цена по умолчанию и градация в каждой зоне останутся как есть)</span></span>
+      <label style="display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;color:#333;cursor:pointer;background:#eef4fc;border:1px solid #d5e6fb;border-radius:6px;padding:8px 12px;margin-bottom:14px;">
+        <input type="checkbox" data-sz-select-all-fields style="width:16px;height:16px;cursor:pointer;">
+        <span>Выбрать все условия этого типа доставки</span>
       </label>
-      <div data-sz-non-payment-fields>
+      <div style="font-size:13px;color:#888;margin-bottom:10px;">
+        Отметьте галочкой только те условия, которые нужно скопировать/применить. Невыбранные условия останутся в каждой зоне как есть.
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;">
-        <label style="font-size:14px;color:#555;">${dynamicCalc ? 'Время динамической доставки (мин)' : 'Время доставки (мин)'}
-          <input type="number" placeholder="не менять" value="${existingTime}"
-            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+        <label style="font-size:14px;color:#555;">
+          <span style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">
+            <input type="checkbox" data-sz-include="${timeFieldName}" style="width:15px;height:15px;cursor:pointer;">
+            ${dynamicCalc ? 'Время динамической доставки (мин)' : 'Время доставки (мин)'}
+          </span>
+          <input type="number" placeholder="значение" value="${existingTime}"
+            style="display:block;width:100%;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
             data-sz-field="${timeFieldName}">
         </label>
-        <label style="font-size:14px;color:#555;">Мин. сумма корзины
-          <input type="number" placeholder="не менять" value="${existingMin}"
-            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+        <label style="font-size:14px;color:#555;">
+          <span style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">
+            <input type="checkbox" data-sz-include="minBasketPrice" style="width:15px;height:15px;cursor:pointer;">
+            Мин. сумма корзины
+          </span>
+          <input type="number" placeholder="значение" value="${existingMin}"
+            style="display:block;width:100%;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
             data-sz-field="minBasketPrice">
         </label>
-        <label style="font-size:14px;color:#555;">${dynamicCalc ? 'Цена динамической доставки по умолчанию' : 'Цена по умолчанию'}
-          <input type="number" placeholder="не менять" value="${existingDef}"
-            style="display:block;width:100%;margin-top:5px;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
+        <label style="font-size:14px;color:#555;">
+          <span style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">
+            <input type="checkbox" data-sz-include="${priceFieldName}" style="width:15px;height:15px;cursor:pointer;">
+            ${dynamicCalc ? 'Цена динамической доставки по умолчанию' : 'Цена по умолчанию'}
+          </span>
+          <input type="number" placeholder="значение" value="${existingDef}"
+            style="display:block;width:100%;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;box-sizing:border-box;"
             data-sz-field="${priceFieldName}">
         </label>
       </div>
@@ -497,23 +669,23 @@
       <div style="font-size:13px;color:#8e44ad;background:#f4ecfb;border:1px solid #e3d3f5;border-radius:6px;padding:8px 12px;margin-bottom:12px;">
         ⚡ Активирован динамический расчёт — ступени градации задаются компенсацией (тип и значение), а не фиксированной ценой.
       </div>` : ''}
-      <div style="font-size:14px;color:#555;margin-bottom:8px;">Градация цен <span style="color:#888;">(пустая таблица = очистить, не трогайте если не нужно менять)</span></div>
-      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:14px;color:#555;margin-bottom:8px;cursor:pointer;">
+        <input type="checkbox" data-sz-include-grad style="width:15px;height:15px;cursor:pointer;">
+        <span>Градация цен <span style="color:#888;">(пустая таблица при включённой галочке = очистить градацию)</span></span>
+      </label>
     `;
-    const nonPaymentWrap = content.querySelector('[data-sz-non-payment-fields]');
     const gradWrap = document.createElement('div');
     gradWrap.setAttribute('data-sz-grad-wrap', '1');
     gradWrap.appendChild(buildGradationEditor(existingGrad, dynamicCalc, dtpData?.compensation?.compensationType));
-    nonPaymentWrap.appendChild(gradWrap);
+    content.appendChild(gradWrap);
 
     content.appendChild(buildPaymentTypesEditor(dtpData?.paymentTypes));
 
-    const onlyPaymentCb = content.querySelector('[data-sz-only-payment]');
-    onlyPaymentCb.addEventListener('change', () => {
-      const disabled = onlyPaymentCb.checked;
-      nonPaymentWrap.style.opacity = disabled ? '0.4' : '1';
-      nonPaymentWrap.style.pointerEvents = disabled ? 'none' : 'auto';
-      nonPaymentWrap.querySelectorAll('input, select, button').forEach(el => { el.disabled = disabled; });
+    const selectAllFieldsCb = content.querySelector('[data-sz-select-all-fields]');
+    selectAllFieldsCb.addEventListener('change', () => {
+      content.querySelectorAll('[data-sz-include], [data-sz-include-grad], [data-sz-include-payment]').forEach(cb => {
+        cb.checked = selectAllFieldsCb.checked;
+      });
     });
 
     if (isCollapsed) {
@@ -538,7 +710,7 @@
   async function onEditConditions() {
     const projectId = getProjectId();
     const shopId    = getShopId();
-    if (!projectId) { showToast('Не удалось определить Project ID. Если вы только что переключили заведение из другого проекта — подождите секунду и повторите. Если не помогает — обновите страницу.', 'error'); return; }
+    if (!projectId) { showToast('Не удалось определить Project ID. Обновите страницу.', 'error'); return; }
     if (!shopId)    { showToast('Не удалось определить ID заведения', 'error'); return; }
     showToast('Загружаем данные...', 'info');
     let doc, typeNameMap;
@@ -608,22 +780,303 @@
       modal.appendChild(buildDeliveryTypeSection(allTypeNames[i], dtpByName[allTypeNames[i]] || null, allTypeNames[i] !== 'Доставка'));
     }
 
+    // --- БЛОК МАССОВОГО ПРИМЕНЕНИЯ ---
+    const massApplyWrap = document.createElement('div');
+    massApplyWrap.style.cssText = 'margin-top:22px; padding:16px; background:#fef2f2; border:2px solid #f3b6b6; border-radius:8px;';
+    massApplyWrap.innerHTML = `
+      <label style="display:flex;align-items:center;gap:10px;font-size:15px;color:#333;cursor:pointer;font-weight:600;">
+        <input type="checkbox" id="sz-mass-toggle" style="width:18px;height:18px;accent-color:#d64236;">
+        <span>⚠️ Применить к нескольким ресторанам <span style="color:#b3261e;font-weight:700;">— будь внимателен!</span></span>
+      </label>
+      <div style="font-size:13px;color:#a13a34;margin-top:6px;margin-left:28px;">
+        Эта операция задевает сразу много ресторанов. Ошибку здесь не откатить одним кликом —
+        восстановление из бэкапа придётся делать вручную и это долго. Дважды проверьте выбор
+        зон и условий перед тем, как жать «Применить».
+      </div>
+      <div id="sz-mass-content" style="display:none; margin-top:15px; border-top:1px solid #f3b6b6; padding-top:15px;">
+        <label style="display:flex;align-items:center;gap:10px;font-size:14px;color:#333;cursor:pointer;font-weight:600;background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;padding:8px 12px;margin-bottom:12px;">
+          <input type="checkbox" id="sz-select-all-global" style="width:17px;height:17px;accent-color:#e67e22;cursor:pointer;">
+          🌍 Применить ко всем зонам во всех ресторанах (кроме архивных)
+        </label>
+        <button id="sz-load-shops-btn" style="padding:10px 14px; border:1px solid #4a90e2; background:#4a90e2; color:#fff; border-radius:6px; cursor:pointer; font-weight:600;">
+          🔄 Загрузить список ресторанов и зон
+        </button>
+        <div style="font-size:13px;color:#888;margin-top:8px;">
+          У каждого ресторана могут быть зоны с разными названиями — раскройте ресторан (клик по стрелке ▸ слева) и отметьте
+          галочками именно те зоны, куда нужно перенести условия. Рестораны без зон показаны в конце списка.
+        </div>
+        <div id="sz-shops-container" style="display:none; margin-top:15px;"></div>
+      </div>
+    `;
+    modal.appendChild(massApplyWrap);
+
+    const backupWrap = document.createElement('label');
+    backupWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#555;margin-top:18px;cursor:pointer;';
+    backupWrap.innerHTML = `
+      <input type="checkbox" id="sz-backup-before" checked style="width:16px;height:16px;cursor:pointer;">
+      <span>Скачать бэкап зон в JSON перед применением <span style="color:#888;">(снимок состояния затронутых зон до изменений — файл сохранится в папку загрузок браузера, пригодится для отката вручную)</span></span>
+    `;
+    modal.appendChild(backupWrap);
+    const backupBeforeCb = backupWrap.querySelector('#sz-backup-before');
+
+    const publishWrap = document.createElement('label');
+    publishWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#555;margin-top:14px;cursor:pointer;';
+    publishWrap.innerHTML = `
+      <input type="checkbox" id="sz-auto-publish" style="width:16px;height:16px;cursor:pointer;">
+      <span>Опубликовать сразу после применения <span style="color:#888;">(иначе изменения останутся черновиком — сохранятся, но не будут видны на сайте, пока вы не нажмёте «Опубликовать» вручную. Скрипт запоминает свои же правки — если черновик с прошлого раза никто, кроме скрипта, не трогал, публикация пройдёт автоматически; если в нём есть посторонние изменения — она пропускается. Для текущего открытого ресторана публикация также не пройдёт, если сама Studio показывает ошибку валидации)</span></span>
+    `;
+    modal.appendChild(publishWrap);
+    const autoPublishCb = publishWrap.querySelector('#sz-auto-publish');
+
+    const forcePublishWrap = document.createElement('label');
+    forcePublishWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;color:#a15c00;margin-top:8px;margin-left:26px;cursor:pointer;';
+    forcePublishWrap.innerHTML = `
+      <input type="checkbox" id="sz-force-publish" style="width:15px;height:15px;cursor:pointer;">
+      <span>🔓 Разрешить публикацию, даже если в ресторане есть посторонние неопубликованные изменения <span style="color:#c98a3a;">(они тоже уйдут в публикацию вместе с вашими — используйте, только если уверены, что ничего чужого не потеряется)</span></span>
+    `;
+    modal.appendChild(forcePublishWrap);
+    const forcePublishCb = forcePublishWrap.querySelector('#sz-force-publish');
+
+    const preflightWrap = document.createElement('label');
+    preflightWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;color:#555;margin-top:8px;margin-left:26px;cursor:pointer;';
+    preflightWrap.innerHTML = `
+      <input type="checkbox" id="sz-preflight-validation" checked style="width:15px;height:15px;cursor:pointer;">
+      <span>🛡️ Перед массовой публикацией проверить валидацию во всех выбранных ресторанах <span style="color:#888;">(медленнее — скрипт по очереди открывает каждый ресторан, ~1–2 сек на ресторан. Если хотя бы у одного не заполнены обязательные поля — публикация всей партии блокируется целиком, ни один ресторан не публикуется, пока поля не будут заполнены вручную)</span></span>
+    `;
+    modal.appendChild(preflightWrap);
+    const preflightValidationCb = preflightWrap.querySelector('#sz-preflight-validation');
+
+    const reloadWrap = document.createElement('label');
+    reloadWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:#555;margin-top:14px;cursor:pointer;';
+    reloadWrap.innerHTML = `
+      <input type="checkbox" id="sz-reload-after" style="width:16px;height:16px;cursor:pointer;">
+      <span>Обновить страницу после применения <span style="color:#888;">(список «Все заведения» иногда не пересчитывает порядок сам — обновление страницы это исправляет; произойдёт через несколько секунд, после того как вы увидите итоговое сообщение)</span></span>
+    `;
+    modal.appendChild(reloadWrap);
+    const reloadAfterCb = reloadWrap.querySelector('#sz-reload-after');
+
     const applyBtn = document.createElement('button');
     applyBtn.textContent = '✅ Применить';
     applyBtn.style.cssText = `
-      margin-top:22px;width:100%;padding:15px;
+      margin-top:14px;width:100%;padding:15px;
       background:#4a90e2;color:#fff;border:none;border-radius:8px;
       font-size:16px;font-weight:700;cursor:pointer;
     `;
-    applyBtn.addEventListener('click', () => applyConditions(overlay, modal, projectId, shopId, doc, targetZones, typeNameMap, allTypeNames));
+
+    // Логика загрузки двухуровневого списка ресторан → зоны
+    let lastLoadedShops = null;
+    const massToggle = massApplyWrap.querySelector('#sz-mass-toggle');
+    const massContent = massApplyWrap.querySelector('#sz-mass-content');
+    const loadShopsBtn = massApplyWrap.querySelector('#sz-load-shops-btn');
+    const shopsContainer = massApplyWrap.querySelector('#sz-shops-container');
+    const selectAllGlobalCb = massApplyWrap.querySelector('#sz-select-all-global');
+
+    massToggle.addEventListener('change', () => {
+      massContent.style.display = massToggle.checked ? 'block' : 'none';
+      if (massToggle.checked) loadShopsBtn.click();
+    });
+
+    selectAllGlobalCb.addEventListener('change', () => {
+      if (selectAllGlobalCb.checked) {
+        if (!lastLoadedShops) loadShopsBtn.click();
+        shopsContainer.style.opacity = '0.4';
+        shopsContainer.style.pointerEvents = 'none';
+      } else {
+        shopsContainer.style.opacity = '1';
+        shopsContainer.style.pointerEvents = 'auto';
+      }
+    });
+
+    loadShopsBtn.addEventListener('click', async () => {
+      loadShopsBtn.textContent = '⏳ Загрузка...';
+      loadShopsBtn.disabled = true;
+      try {
+        const shops = await fetchAllShops(projectId);
+        // Рестораны без зон переносим в конец списка (сортировка стабильна,
+        // порядок name.ru asc внутри каждой группы сохраняется)
+        shops.sort((a, b) => {
+          const aEmpty = (a.zones || []).length === 0;
+          const bEmpty = (b.zones || []).length === 0;
+          if (aEmpty === bEmpty) return 0;
+          return aEmpty ? 1 : -1;
+        });
+        lastLoadedShops = shops;
+        shopsContainer.innerHTML = '';
+        if (shops.length === 0) {
+          shopsContainer.innerHTML = '<div style="color:#888;">Рестораны не найдены</div>';
+        } else {
+          const searchBox = document.createElement('input');
+          searchBox.type = 'text';
+          searchBox.placeholder = 'Поиск по названию ресторана...';
+          searchBox.style.cssText = 'width:100%; padding:8px; margin-bottom:10px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box;';
+          shopsContainer.appendChild(searchBox);
+
+          const globalActions = document.createElement('div');
+          globalActions.style.cssText = 'display:flex; gap:14px; margin-bottom:8px; font-size:13px;';
+          globalActions.innerHTML = `
+            <a href="#" data-sz-expand-all style="color:#4a90e2; text-decoration:none;">Развернуть все</a>
+            <a href="#" data-sz-collapse-all style="color:#4a90e2; text-decoration:none;">Свернуть все</a>
+          `;
+          shopsContainer.appendChild(globalActions);
+
+          const shopsList = document.createElement('div');
+          shopsList.style.cssText = 'max-height:340px; overflow-y:auto; border:1px solid #eee; border-radius:6px; padding:10px;';
+
+          for (const shop of shops) {
+            const zones = shop.zones || [];
+            const shopDetails = document.createElement('details');
+            shopDetails.setAttribute('data-sz-shop-block', shop._id);
+            shopDetails.style.cssText = 'border:1px solid #eee; border-radius:6px; margin-bottom:6px; padding:6px 10px;';
+            shopDetails.dataset.shopName = (shop.name?.ru || '').toLowerCase();
+
+            const summary = document.createElement('summary');
+            summary.style.cssText = 'display:flex; align-items:center; gap:8px; cursor:pointer; list-style:none;';
+
+            const chevron = document.createElement('span');
+            chevron.textContent = zones.length > 0 ? '▸' : '';
+            chevron.title = zones.length > 0 ? 'Развернуть/свернуть зоны' : '';
+            chevron.style.cssText = 'display:inline-flex; align-items:center; justify-content:center; width:18px; flex-shrink:0; color:#444; font-size:18px; font-weight:700; transition:transform 0.15s ease;';
+
+            const shopAllCb = document.createElement('input');
+            shopAllCb.type = 'checkbox';
+            shopAllCb.setAttribute('data-sz-shop-all', shop._id);
+            shopAllCb.style.cssText = 'width:16px;height:16px;cursor:pointer;flex-shrink:0;';
+            shopAllCb.disabled = zones.length === 0;
+            shopAllCb.addEventListener('click', e => e.stopPropagation());
+
+            const labelSpan = document.createElement('span');
+            const addressStr = `${shop.address?.street?.ru || ''} ${shop.address?.house?.ru || ''}`.trim();
+            labelSpan.textContent = `${shop.name?.ru || shop._id}${addressStr ? ' (' + addressStr + ')' : ''} — ${zones.length} ${zones.length === 1 ? 'зона' : 'зон'}`;
+            labelSpan.style.cssText = zones.length === 0 ? 'color:#bbb;' : '';
+
+            summary.appendChild(chevron);
+            summary.appendChild(shopAllCb);
+            summary.appendChild(labelSpan);
+            shopDetails.appendChild(summary);
+
+            if (zones.length > 0) {
+              shopDetails.addEventListener('toggle', () => {
+                chevron.style.transform = shopDetails.open ? 'rotate(90deg)' : 'rotate(0deg)';
+              });
+              const zonesWrap = document.createElement('div');
+              zonesWrap.style.cssText = 'margin-top:8px; padding-left:26px; display:flex; flex-direction:column; gap:5px;';
+
+              for (const zone of zones) {
+                const zLabel = document.createElement('label');
+                zLabel.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:14px; color:#333; cursor:pointer;';
+                const zCb = document.createElement('input');
+                zCb.type = 'checkbox';
+                zCb.setAttribute('data-sz-shop-id', shop._id);
+                zCb.setAttribute('data-sz-zone-key', zone._key);
+                zCb.style.cssText = 'width:15px;height:15px;cursor:pointer;flex-shrink:0;';
+                const zSpan = document.createElement('span');
+                zSpan.textContent = zone.name || '(без названия)';
+                zLabel.appendChild(zCb);
+                zLabel.appendChild(zSpan);
+                zonesWrap.appendChild(zLabel);
+              }
+
+              shopAllCb.addEventListener('change', () => {
+                zonesWrap.querySelectorAll('input[data-sz-zone-key]').forEach(cb => { cb.checked = shopAllCb.checked; });
+              });
+              zonesWrap.addEventListener('change', () => {
+                const all    = zonesWrap.querySelectorAll('input[data-sz-zone-key]');
+                const checked = zonesWrap.querySelectorAll('input[data-sz-zone-key]:checked');
+                shopAllCb.checked       = all.length > 0 && checked.length === all.length;
+                shopAllCb.indeterminate = checked.length > 0 && checked.length < all.length;
+              });
+
+              shopDetails.appendChild(zonesWrap);
+            }
+
+            shopsList.appendChild(shopDetails);
+          }
+
+          shopsContainer.appendChild(shopsList);
+
+          searchBox.addEventListener('input', () => {
+            const term = searchBox.value.toLowerCase();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => {
+              d.style.display = (d.dataset.shopName || '').includes(term) ? '' : 'none';
+            });
+          });
+
+          globalActions.querySelector('[data-sz-expand-all]').addEventListener('click', e => {
+            e.preventDefault();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = true; });
+          });
+          globalActions.querySelector('[data-sz-collapse-all]').addEventListener('click', e => {
+            e.preventDefault();
+            shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = false; });
+          });
+        }
+        shopsContainer.style.display = 'block';
+        if (selectAllGlobalCb.checked) {
+          shopsContainer.style.opacity = '0.4';
+          shopsContainer.style.pointerEvents = 'none';
+        }
+      } catch(e) {
+        showToast('Ошибка загрузки списка: ' + e.message, 'error');
+      } finally {
+        loadShopsBtn.textContent = '🔄 Загрузить список ресторанов и зон';
+        loadShopsBtn.disabled = false;
+      }
+    });
+
+    // Собирает выбор пользователя как карту { shopId: [zoneKey, zoneKey, ...] }.
+    // Если включён глобальный чекбокс — берём все зоны всех загруженных ресторанов
+    // (у ресторанов без зон массив зон просто пуст и они будут пропущены).
+    function collectSelectedShopZones() {
+      if (selectAllGlobalCb.checked) {
+        const map = {};
+        for (const shop of (lastLoadedShops || [])) {
+          const zones = shop.zones || [];
+          if (zones.length === 0) continue;
+          map[shop._id] = zones.map(z => z._key);
+        }
+        return map;
+      }
+      const map = {};
+      shopsContainer.querySelectorAll('input[data-sz-zone-key]:checked').forEach(cb => {
+        const shopId  = cb.getAttribute('data-sz-shop-id');
+        const zoneKey = cb.getAttribute('data-sz-zone-key');
+        (map[shopId] ||= []).push(zoneKey);
+      });
+      return map;
+    }
+
+    applyBtn.addEventListener('click', () => {
+      const isMassApply  = massToggle.checked;
+      const autoPublish  = autoPublishCb.checked;
+      const forcePublish = forcePublishCb.checked;
+      const reloadAfter  = reloadAfterCb.checked;
+      const backupBefore = backupBeforeCb.checked;
+      const preflightValidation = preflightValidationCb.checked;
+      let selectedShopZones = {};
+      if (isMassApply) {
+        selectedShopZones = collectSelectedShopZones();
+        if (Object.keys(selectedShopZones).length === 0) {
+          showToast('Отметьте хотя бы одну зону хотя бы в одном ресторане (или включите «Применить ко всем зонам во всех ресторанах»)', 'warning');
+          return;
+        }
+      }
+      const doApply = () => {
+        applyConditions(overlay, modal, projectId, shopId, doc, targetZones, typeNameMap, allTypeNames, isMassApply, selectedShopZones, autoPublish, reloadAfter, backupBefore, forcePublish, preflightValidation);
+      };
+
+      if (isMassApply) {
+        showMassApplyConfirm(Object.keys(selectedShopZones).length, doApply);
+      } else {
+        doApply();
+      }
+    });
+
     modal.appendChild(applyBtn);
     overlay.appendChild(modal);
     overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
     document.body.appendChild(overlay);
   }
 
-  // Значение "цены" ступени градации для сравнения: обычная цена или, при
-  // динамическом расчёте, значение компенсации.
   function gradRowValue(row, dynamicCalc) {
     if (!row) return 0;
     const v = dynamicCalc ? row.compensation?.compensationValue : row.price;
@@ -639,19 +1092,13 @@
     return map;
   }
 
-  // Собирает предупреждения "нужно проверить доставочное блюдо" для одной пары зона+тип:
-  // 1) новая цена > 0 и условия изменились -> предупреждение
-  // 2) было платно, стало бесплатно -> предупреждение
-  // 3) было бесплатно и осталось бесплатно -> без предупреждения
   function collectPriceWarnings(zoneName, typeName, dtp, change, priceFieldName, dynamicCalc) {
     const warnings = [];
-
     const oldDefault = (typeof dtp?.[priceFieldName] === 'number') ? dtp[priceFieldName] : 0;
     const newDefault = (priceFieldName in change) ? change[priceFieldName] : oldDefault;
     if (newDefault !== oldDefault && (newDefault > 0 || oldDefault > 0)) {
-      warnings.push(`${zoneName} — ${typeName}: цена по умолчанию ${oldDefault}₽ → ${newDefault}₽`);
+      warnings.push(`${zoneName} — ${typeName}: цена ${oldDefault}₽ → ${newDefault}₽`);
     }
-
     const oldGradMap = gradRowsToMap(dtp?.deliveryPrice, dynamicCalc);
     const newGradMap = ('deliveryPrice' in change) ? gradRowsToMap(change.deliveryPrice, dynamicCalc) : oldGradMap;
     const allKeys = new Set([...Object.keys(oldGradMap), ...Object.keys(newGradMap)]);
@@ -665,7 +1112,7 @@
     return warnings;
   }
 
-  async function applyConditions(overlay, modal, projectId, shopId, doc, targetZones, typeNameMap, allTypeNames) {
+  async function applyConditions(overlay, modal, projectId, currentShopId, currentDoc, currentTargetZones, currentTypeNameMap, allTypeNames, isMassApply, selectedShopZones, autoPublish, reloadAfter, backupBefore, forcePublish, preflightValidation) {
     const changes  = {};
     const typeMeta = {};
     for (const typeName of allTypeNames) {
@@ -675,72 +1122,318 @@
       const priceFieldName = section.getAttribute('data-sz-price-field') || 'defaultDeliveryPrice';
       typeMeta[typeName] = { dynamicCalc, priceFieldName };
 
-      const onlyPayment = section.querySelector('[data-sz-only-payment]')?.checked === true;
-
       const entry = {};
-      if (!onlyPayment) {
-        section.querySelectorAll('[data-sz-field]').forEach(input => {
-          const fieldName = input.getAttribute('data-sz-field');
-          const val = input.value.trim();
-          if (val !== '') entry[fieldName] = parseFloat(val);
-        });
+      section.querySelectorAll('[data-sz-field]').forEach(input => {
+        const fieldName  = input.getAttribute('data-sz-field');
+        const includeCb  = section.querySelector(`[data-sz-include="${fieldName}"]`);
+        if (!includeCb?.checked) return;
+        const val = input.value.trim();
+        entry[fieldName] = val === '' ? undefined : parseFloat(val);
+      });
+      // Убираем поля, которые отмечены галочкой, но оставлены пустыми — применять нечего
+      for (const key of Object.keys(entry)) {
+        if (entry[key] === undefined || isNaN(entry[key])) delete entry[key];
+      }
+
+      const includeGrad = section.querySelector('[data-sz-include-grad]')?.checked === true;
+      if (includeGrad) {
         const gradWrap = section.querySelector('[data-sz-grad-wrap]');
         if (gradWrap) entry.deliveryPrice = readGradation(gradWrap, dynamicCalc);
       }
-      const paymentTypes = readPaymentTypes(section);
-      if (paymentTypes) entry.paymentTypes = paymentTypes;
+
+      const includePayment = section.querySelector('[data-sz-include-payment]')?.checked === true;
+      if (includePayment) {
+        const paymentTypes = readPaymentTypes(section);
+        if (paymentTypes) entry.paymentTypes = paymentTypes;
+      }
+
       if (Object.keys(entry).length > 0) changes[typeName] = entry;
     }
     if (Object.keys(changes).length === 0) { showToast('Нет изменений для применения', 'warning'); return; }
 
-    const draftId  = 'drafts.' + shopId;
-    const hasDraft = doc._id.startsWith('drafts.');
-    const mutations = [];
-    if (!hasDraft) {
-      const { documents } = await (await apiFetch(projectId, `/data/doc/production/${shopId}`)).json();
-      mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
-    }
-
-    const priceWarnings = [];
-    for (const zone of targetZones) {
-      for (const dtp of (zone.deliveryTypePrices || [])) {
-        const typeName = typeNameMap[dtp.deliveryType?._ref];
-        const change   = changes[typeName];
-        if (!change) continue;
-        const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
-        const setFields = {};
-        for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
-        if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
-
-        const meta = typeMeta[typeName];
-        if (meta) priceWarnings.push(...collectPriceWarnings(zone.name, typeName, dtp, change, meta.priceFieldName, meta.dynamicCalc));
-      }
-    }
-
-    if (mutations.length === 0) { showToast('Не найдены совпадающие типы доставки в зонах', 'warning'); return; }
-
     overlay.remove();
-    showToast('Применяем изменения...', 'info');
-    try {
-      const r = await apiFetch(projectId, `/data/mutate/production`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mutations })
-      });
-      const result = await r.json();
-      if (r.ok) {
-        let msg = `✅ Условия обновлены в ${targetZones.length} зон(ах):\n` + Object.keys(changes).map(t => `• ${t}`).join('\n') + '\n\nНажмите «Опубликовать»';
-        let type = 'success';
-        if (priceWarnings.length > 0) {
-          msg += '\n\n⚠️ Проверьте «Позицию для доставки из POS-системы» — цена изменилась:\n' + priceWarnings.map(w => `• ${w}`).join('\n');
-          type = 'warning';
-        }
-        showToast(msg, type, priceWarnings.length > 0 ? 12000 : 5000);
-      } else {
-        showToast('Ошибка Sanity: ' + JSON.stringify(result?.error || result), 'error');
+
+    // Одиночное применение (оригинальный функционал, без изменений)
+    if (!isMassApply) {
+      if (backupBefore) {
+        downloadJson(backupFilename(`sanity-backup_${currentDoc.name?.ru || currentShopId}`), {
+          createdAt: new Date().toISOString(),
+          projectId,
+          operation: 'single-apply',
+          shopId: currentShopId,
+          shopName: currentDoc.name?.ru || null,
+          typesChanged: Object.keys(changes),
+          zonesBackup: currentTargetZones
+        });
       }
-    } catch (e) {
-      showToast('Ошибка: ' + e.message, 'error');
+      showToast('Применяем изменения...', 'info');
+      try {
+        const draftId  = 'drafts.' + currentShopId;
+        const hasDraft = currentDoc._id.startsWith('drafts.');
+        // "Свой" черновик — это либо новый (мы его сейчас создаём), либо уже существующий,
+        // но с ревизией, совпадающей с той, что скрипт сам оставил в прошлый раз.
+        const ownedRev     = hasDraft ? getOwnedDraftRev(projectId, currentShopId) : null;
+        const isKnownOwned = !hasDraft || (ownedRev !== null && ownedRev === currentDoc._rev);
+        const isForeignDraft = hasDraft && !isKnownOwned;
+        const mutations = [];
+        if (!hasDraft) {
+          const { documents } = await (await apiFetch(projectId, `/data/doc/production/${currentShopId}`)).json();
+          mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+        }
+
+        const priceWarnings = [];
+        for (const zone of currentTargetZones) {
+          for (const dtp of (zone.deliveryTypePrices || [])) {
+            const typeName = currentTypeNameMap[dtp.deliveryType?._ref];
+            const change   = changes[typeName];
+            if (!change) continue;
+            const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
+            const setFields = {};
+            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
+            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+
+            const meta = typeMeta[typeName];
+            if (meta) priceWarnings.push(...collectPriceWarnings(zone.name, typeName, dtp, change, meta.priceFieldName, meta.dynamicCalc));
+          }
+        }
+
+        if (mutations.length === 0) { showToast('Не найдены совпадающие типы доставки в зонах', 'warning'); return; }
+
+        const r = await apiFetch(projectId, `/data/mutate/production?returnIds=true&returnDocuments=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mutations })
+        });
+        const result = await r.json();
+        if (r.ok) {
+          // Патч прошёл успешно. Если весь черновик был (или стал) полностью "нашим" —
+          // запоминаем новую ревизию, чтобы в следующий раз распознать его как свой.
+          const draftResult = result.results?.find(x => x.id === draftId);
+          const newRev = draftResult?.document?._rev || null;
+          if (isKnownOwned) setOwnedDraftRev(projectId, currentShopId, newRev);
+
+          let published = false;
+          let publishError = null;
+          let publishSkipped = false;
+          let skipReason = null; // 'foreign' | 'validation'
+          if (autoPublish) {
+            if (isForeignDraft && !forcePublish) {
+              // В черновике есть правки, оставленные не этим скриптом (или другим браузером/
+              // компьютером без той же localStorage-метки) — публиковать их вслепую нельзя.
+              publishSkipped = true;
+              skipReason = 'foreign';
+            } else if (hasStudioValidationError()) {
+              // Сама Studio уже посчитала и показала ошибку валидации на этой странице
+              // (панель "Валидация" справа) — какая бы кастомная проверка ни сработала,
+              // публиковать нельзя, пока она не исправлена.
+              publishSkipped = true;
+              skipReason = 'validation';
+            } else {
+              try {
+                published = await publishDoc(projectId, currentShopId);
+                if (published) clearOwnedDraftRev(projectId, currentShopId);
+              }
+              catch (e) { publishError = e.message; }
+            }
+          }
+          let msg = `✅ Условия обновлены в ${currentTargetZones.length} зон(ах):\n` + Object.keys(changes).map(t => `• ${t}`).join('\n');
+          if (published) {
+            msg += '\n\n✅ Опубликовано';
+          } else if (publishSkipped && skipReason === 'validation') {
+            msg += '\n\n⏸ Публикация пропущена: Studio показывает ошибки валидации на этой странице (см. панель «Валидация» справа) — исправьте и опубликуйте вручную.';
+          } else if (publishSkipped) {
+            msg += '\n\n⏸ Публикация пропущена: в этом ресторане уже есть другие неопубликованные изменения — требуется ручная проверка перед публикацией (или включите «Разрешить публикацию поверх посторонних изменений»).';
+          } else if (autoPublish) {
+            msg += `\n\n⚠️ Не удалось опубликовать автоматически: ${publishError}. Нажмите «Опубликовать» вручную.`;
+          } else {
+            msg += '\n\nНажмите «Опубликовать»';
+          }
+          let type = (publishSkipped || (priceWarnings.length > 0)) ? 'warning' : 'success';
+          if (priceWarnings.length > 0) {
+            msg += '\n\n⚠️ Проверьте «Позицию для доставки»:\n' + priceWarnings.map(w => `• ${w}`).join('\n');
+          }
+          const toastDuration = (publishSkipped || priceWarnings.length > 0) ? 12000 : 5000;
+          showToast(msg, type, toastDuration);
+          if (reloadAfter) setTimeout(() => location.reload(), toastDuration + 500);
+        } else {
+          showToast('Ошибка Sanity: ' + JSON.stringify(result?.error || result), 'error');
+        }
+      } catch (e) {
+        showToast('Ошибка: ' + e.message, 'error');
+      }
+      return;
+    }
+
+    // --- МАССОВОЕ ПРИМЕНЕНИЕ (по явно выбранным зонам в каждом ресторане) ---
+    const shopIds = Object.keys(selectedShopZones);
+
+    // Предполётная проверка: если публикуем автоматически, сначала убеждаемся,
+    // что ВСЕ выбранные рестораны проходят валидацию Studio. Если хотя бы один
+    // не проходит — блокируем ВСЮ операцию целиком, ни один ресторан не трогаем.
+    if (autoPublish && preflightValidation) {
+      const workspace    = currentWorkspace();
+      const originalPath = location.pathname;
+      showToast(`Проверяем валидацию ${shopIds.length} ресторан(ов) перед публикацией...`, 'info', 3000);
+      let invalidShops;
+      try {
+        invalidShops = await checkShopsValidationBeforePublish(workspace, shopIds, originalPath, true);
+      } catch (e) {
+        showToast('Не удалось проверить валидацию: ' + e.message + '. Массовая публикация отменена — попробуйте ещё раз или снимите галочку предполётной проверки.', 'error', 15000);
+        return;
+      }
+      if (invalidShops.length > 0) {
+        const list = invalidShops.map(s => `• ${s.shopName}`).join('\n');
+        showToast(
+          `⛔ Массовая публикация заблокирована.\n\n` +
+          `У ${invalidShops.length} из ${shopIds.length} ресторан(ов) не заполнены обязательные поля ` +
+          `(валидация Studio не пройдена):\n${list}\n\n` +
+          `Сначала заполните обязательные поля в этих ресторанах вручную в интерфейсе, ` +
+          `и только потом повторите массовое применение. Ни один ресторан не был изменён.`,
+          'error', 25000
+        );
+        return;
+      }
+      showToast('Валидация пройдена во всех ресторанах, продолжаем...', 'success', 2000);
+    }
+
+    let progress = 0;
+    const total = shopIds.length;
+    const allWarnings = [];
+    const publishSkippedWarnings = [];
+    const massBackups = [];
+
+    for (const shopId of shopIds) {
+      progress++;
+      showToast(`Массовое обновление: ${progress} из ${total}...`, 'info', 2000);
+      const zoneKeys = selectedShopZones[shopId] || [];
+      if (zoneKeys.length === 0) continue;
+      try {
+        const doc = await getDoc(projectId, shopId);
+        if (!doc) { allWarnings.push(`${shopId}: заведение не найдено.`); continue; }
+
+        const allRefs = new Set();
+        for (const zone of (doc.deliveryZones || []))
+          for (const dtp of (zone.deliveryTypePrices || []))
+            if (dtp.deliveryType?._ref) allRefs.add(dtp.deliveryType._ref);
+        const typeNameMap = await resolveDeliveryTypeNames(projectId, [...allRefs]);
+
+        // Матчим зоны по _key, а не по имени — так надёжно работает,
+        // даже если в ресторане другое число зон или другие названия.
+        const targetZones = (doc.deliveryZones || []).filter(z => zoneKeys.includes(z._key));
+        if (targetZones.length === 0) {
+          allWarnings.push(`${doc.name?.ru || shopId}: выбранные зоны не найдены (возможно, были изменены после загрузки списка — обновите список и попробуйте снова).`);
+          continue;
+        }
+
+        if (backupBefore) {
+          massBackups.push({ shopId, shopName: doc.name?.ru || null, zones: targetZones });
+        }
+
+        const draftId = 'drafts.' + shopId;
+        const hasDraft = doc._id.startsWith('drafts.');
+        const ownedRev       = hasDraft ? getOwnedDraftRev(projectId, shopId) : null;
+        const isKnownOwned   = !hasDraft || (ownedRev !== null && ownedRev === doc._rev);
+        const isForeignDraft = hasDraft && !isKnownOwned;
+        const mutations = [];
+
+        if (!hasDraft) {
+          const { documents } = await (await apiFetch(projectId, `/data/doc/production/${shopId}`)).json();
+          mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+        }
+
+        const appliedTypes = new Set();
+
+        for (const zone of targetZones) {
+          for (const dtp of (zone.deliveryTypePrices || [])) {
+            const typeName = typeNameMap[dtp.deliveryType?._ref];
+            const change = changes[typeName];
+            if (!change) continue;
+
+            appliedTypes.add(typeName);
+            const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
+            const setFields = {};
+            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
+
+            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+          }
+        }
+
+        for (const typeName of Object.keys(changes)) {
+          if (!appliedTypes.has(typeName)) {
+            allWarnings.push(`${doc.name?.ru || shopId}: в выбранных зонах нет типа "${typeName}"`);
+          }
+        }
+
+        if (mutations.length > 0) {
+          const r = await apiFetch(projectId, `/data/mutate/production?returnIds=true&returnDocuments=true`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mutations })
+          });
+          if (!r.ok) {
+            const result = await r.json();
+            allWarnings.push(`${doc.name?.ru || shopId}: ошибка Sanity - ${JSON.stringify(result?.error)}`);
+          } else {
+            const mutateResult = await r.json();
+            const draftResult  = mutateResult.results?.find(x => x.id === draftId);
+            const newRev = draftResult?.document?._rev || null;
+            if (isKnownOwned) setOwnedDraftRev(projectId, shopId, newRev);
+
+            if (autoPublish) {
+              if (isForeignDraft && !forcePublish) {
+                // В черновике есть правки не от этого скрипта — публиковать их вслепую нельзя,
+                // нужна ручная проверка в интерфейсе (или включите «Разрешить публикацию
+                // поверх посторонних изменений»).
+                publishSkippedWarnings.push(`${doc.name?.ru || shopId}: есть другие неопубликованные изменения — публикация пропущена`);
+              } else {
+                try {
+                  await publishDoc(projectId, shopId);
+                  clearOwnedDraftRev(projectId, shopId);
+                }
+                catch (e) { allWarnings.push(`${doc.name?.ru || shopId}: изменения сохранены, но публикация не удалась - ${e.message}`); }
+              }
+            }
+          }
+        }
+      } catch(e) {
+        allWarnings.push(`${shopId}: ${e.message}`);
+      }
+      // Задержка 300мс для стабильности API
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (backupBefore && massBackups.length > 0) {
+      downloadJson(backupFilename('sanity-backup_mass-apply'), {
+        createdAt: new Date().toISOString(),
+        projectId,
+        operation: 'mass-apply',
+        typesChanged: Object.keys(changes),
+        shopsCount: massBackups.length,
+        shops: massBackups
+      });
+    }
+
+    let msg = autoPublish
+      ? `✅ Массовое обновление завершено (${total} ресторанов).`
+      : `✅ Массовое обновление завершено (${total} ресторанов).\nНажмите «Опубликовать» в интерфейсах обновленных ресторанов.`;
+    let toastType = 'success';
+    if (publishSkippedWarnings.length > 0) {
+      msg += `\n\n⏸ Публикация пропущена (${publishSkippedWarnings.length}) — в этих ресторанах уже были другие неопубликованные изменения, нужна ручная проверка перед публикацией:\n`
+        + publishSkippedWarnings.slice(0, 30).map(w => `• ${w}`).join('\n');
+      if (publishSkippedWarnings.length > 30) msg += `\n...и еще ${publishSkippedWarnings.length - 30}`;
+      toastType = 'warning';
+    }
+    if (allWarnings.length > 0) {
+      msg += `\n\n⚠️ Предупреждения (${allWarnings.length}):\n` + allWarnings.slice(0, 30).join('\n');
+      if (allWarnings.length > 30) msg += `\n...и еще ${allWarnings.length - 30}`;
+      toastType = 'warning';
+    }
+    if (toastType === 'warning') {
+      showToast(msg, 'warning', 15000);
+      if (reloadAfter) setTimeout(() => location.reload(), 15500);
+    } else {
+      showToast(msg, 'success', 8000);
+      if (reloadAfter) setTimeout(() => location.reload(), 8500);
     }
   }
 
@@ -839,8 +1532,6 @@
     inject();
   }
 
-  // Скрипт теперь стартует на document-start, поэтому document.body может
-  // ещё не существовать в момент выполнения — ждём его появления.
   if (document.body) {
     startObserving();
   } else {
