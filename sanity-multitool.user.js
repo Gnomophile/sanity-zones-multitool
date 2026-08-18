@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      6.10
-// @description  Чекбоксы, копирование/вставка зон, точечный выбор условий, JSON-бэкап перед изменением, массовое применение (опасная зона с доп. подтверждением "Точно?") с выбором зон, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
+// @version      6.11
+// @description  Чекбоксы, копирование/вставка зон, точечный выбор условий, поиск и выбор блюда каталога ("Позиция для доставки из POS-системы") для платных цен доставки, JSON-бэкап перед изменением, массовое применение (опасная зона с доп. подтверждением "Точно?") с выбором зон, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
 // @run-at       document-start
@@ -138,6 +138,36 @@
     const map = {};
     for (const d of documents) map[d._id] = d.name?.ru || d.title?.ru || d._id;
     return map;
+  }
+
+  // Резолвит названия блюд каталога (тип "meal") по их id — для отображения
+  // человекочитаемого названия у уже выбранной "Позиции для доставки из POS-системы".
+  async function resolveMealNames(projectId, refs) {
+    if (!refs.length) return {};
+    const r = await apiFetch(projectId, `/data/doc/production/${refs.join(',')}`);
+    const { documents } = await r.json();
+    const map = {};
+    for (const d of documents) map[d._id] = d.name?.ru || d.iikoName || d._id;
+    return map;
+  }
+
+  // Поиск блюд каталога по названию — используется в поиске "Позиции для доставки
+  // из POS-системы" в модалке условий. Ищет и по обычному названию, и по названию
+  // из POS (iikoName), так как у доставочных позиций часто заполнено только оно.
+  async function searchMeals(projectId, term) {
+    const raw = (term || '').trim();
+    if (!raw) return [];
+    const safe = raw.replace(/["\\]/g, '').slice(0, 60);
+    if (!safe) return [];
+    const query = encodeURIComponent(
+      `*[_type == "meal" && (name.ru match "*${safe}*" || iikoName match "*${safe}*")] | order(name.ru asc) [0...25]{
+        _id, "title": coalesce(name.ru, iikoName, _id), "code": code.current, status
+      }`
+    );
+    const r = await apiFetch(projectId, `/data/query/production?query=${query}`);
+    if (!r.ok) throw new Error('запрос к каталогу не удался');
+    const { result } = await r.json();
+    return result || [];
   }
 
   // Публикует черновик заведения: копирует содержимое drafts.{id} в опубликованный
@@ -506,7 +536,125 @@
     return checked;
   }
 
-  function buildGradationEditor(rows, dynamicCalc, defaultCompType) {
+  // Виджет выбора "Позиции для доставки из POS-системы" — обязательного блюда из
+  // каталога, которое Sanity требует указывать, когда доставка платная (цена по
+  // умолчанию или ступень градации != 0). Хранит выбор в data-атрибутах на самом
+  // wrap-элементе (productRef/productTitle), чтобы его было легко прочитать при
+  // сборе изменений и при проверке "не забыли ли выбрать блюдо".
+  function buildProductPicker(projectId, opts) {
+    opts = opts || {};
+    const wrap = document.createElement('div');
+    wrap.setAttribute('data-sz-product-picker', '1');
+    wrap.dataset.productRef = opts.currentRef || '';
+    wrap.dataset.productTitle = opts.currentTitle || '';
+    wrap.style.cssText = 'margin-top:6px;';
+
+    const label = document.createElement('div');
+    label.textContent = 'Позиция для доставки из POS-системы';
+    label.style.cssText = 'font-size:12px;color:#888;margin-bottom:4px;';
+    wrap.appendChild(label);
+
+    const chipRow = document.createElement('div');
+    chipRow.style.cssText = 'display:flex;align-items:center;gap:6px;';
+
+    const chip = document.createElement('div');
+    chip.style.cssText = 'flex:1;min-width:0;padding:7px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;background:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+
+    const searchBtn = document.createElement('button');
+    searchBtn.type = 'button';
+    searchBtn.textContent = '🔍';
+    searchBtn.title = 'Найти блюдо в каталоге Sanity';
+    searchBtn.style.cssText = 'padding:7px 10px;border:1px solid #4a90e2;background:#fff;color:#4a90e2;border-radius:6px;cursor:pointer;font-size:13px;flex-shrink:0;';
+
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.textContent = '✕';
+    clearBtn.title = 'Убрать выбранное блюдо';
+    clearBtn.style.cssText = 'padding:7px 9px;border:1px solid #e74c3c;background:#fff;color:#e74c3c;border-radius:6px;cursor:pointer;font-size:13px;flex-shrink:0;';
+
+    chipRow.appendChild(chip);
+    chipRow.appendChild(searchBtn);
+    chipRow.appendChild(clearBtn);
+    wrap.appendChild(chipRow);
+
+    const searchPanel = document.createElement('div');
+    searchPanel.style.cssText = 'display:none;margin-top:6px;border:1px solid #ddd;border-radius:6px;padding:8px;background:#fafafa;';
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.placeholder = 'Поиск блюда по названию...';
+    searchInput.style.cssText = 'width:100%;padding:7px 9px;border:1px solid #ccc;border-radius:6px;font-size:13px;box-sizing:border-box;';
+    const resultsList = document.createElement('div');
+    resultsList.style.cssText = 'max-height:220px;overflow-y:auto;margin-top:6px;';
+    searchPanel.appendChild(searchInput);
+    searchPanel.appendChild(resultsList);
+    wrap.appendChild(searchPanel);
+
+    function render() {
+      const ref = wrap.dataset.productRef;
+      const title = wrap.dataset.productTitle;
+      if (ref) {
+        chip.textContent = title || ref;
+        chip.style.color = '#333';
+        clearBtn.style.display = '';
+      } else {
+        chip.textContent = 'Блюдо не выбрано';
+        chip.style.color = '#aaa';
+        clearBtn.style.display = 'none';
+      }
+    }
+    render();
+
+    function setSelection(id, title) {
+      wrap.dataset.productRef = id || '';
+      wrap.dataset.productTitle = title || '';
+      render();
+    }
+
+    searchBtn.addEventListener('click', () => {
+      const opening = searchPanel.style.display !== 'block';
+      searchPanel.style.display = opening ? 'block' : 'none';
+      if (opening) { searchInput.value = ''; resultsList.innerHTML = ''; searchInput.focus(); }
+    });
+    clearBtn.addEventListener('click', () => setSelection('', ''));
+
+    let debTimer = null;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(debTimer);
+      const term = searchInput.value.trim();
+      if (!term) { resultsList.innerHTML = ''; return; }
+      debTimer = setTimeout(async () => {
+        resultsList.innerHTML = '<div style="padding:6px;color:#999;font-size:12px;">Ищем...</div>';
+        try {
+          const items = await searchMeals(projectId, term);
+          resultsList.innerHTML = '';
+          if (!items.length) {
+            resultsList.innerHTML = '<div style="padding:6px;color:#999;font-size:12px;">Ничего не найдено</div>';
+            return;
+          }
+          items.forEach(m => {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:6px 8px;cursor:pointer;border-radius:4px;font-size:13px;color:#333;';
+            let text = m.title + (m.status === false ? ' (отключено)' : '');
+            if (m.code) text += ' — ' + m.code;
+            row.textContent = text;
+            row.addEventListener('mouseenter', () => { row.style.background = '#eef4fc'; });
+            row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
+            row.addEventListener('click', () => {
+              setSelection(m._id, m.title);
+              searchPanel.style.display = 'none';
+            });
+            resultsList.appendChild(row);
+          });
+        } catch (e) {
+          resultsList.innerHTML = '<div style="padding:6px;color:#e74c3c;font-size:12px;">Ошибка поиска: ' + e.message + '</div>';
+        }
+      }, 300);
+    });
+
+    return wrap;
+  }
+
+  function buildGradationEditor(rows, dynamicCalc, defaultCompType, projectId, mealNameMap) {
     const wrap = document.createElement('div');
     wrap.style.cssText = 'margin-top:6px;';
     const table = document.createElement('div');
@@ -537,14 +685,16 @@
         'data-sz-grad-comp-type data-sz-raw-map="' + encodedMap + '">' + optionsHtml + '</select>';
     }
 
-    function addRow(basketPriceTo, price, compType, compValue) {
+    function addRow(basketPriceTo, price, compType, compValue, productRef, productTitle) {
       basketPriceTo = basketPriceTo ?? '';
       price = price ?? '';
       compValue = compValue ?? '';
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
+      row.style.cssText = 'display:flex; flex-direction:column; gap:8px; padding:8px; border:1px solid #eee; border-radius:8px; background:#fff;';
+      const topRow = document.createElement('div');
+      topRow.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
       if (dynamicCalc) {
-        row.innerHTML =
+        topRow.innerHTML =
           '<span style="font-size:14px;color:#888;white-space:nowrap;">до &#8381;</span>' +
           '<input type="number" placeholder="сумма корзины" value="' + basketPriceTo + '" ' +
             'style="width:130px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-to>' +
@@ -554,7 +704,7 @@
             'style="width:110px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-comp-value>' +
           '<button type="button" style="padding:6px 12px;border:none;background:#e74c3c;color:#fff;border-radius:6px;cursor:pointer;font-size:15px;" data-sz-grad-del>&#10005;</button>';
       } else {
-        row.innerHTML =
+        topRow.innerHTML =
           '<span style="font-size:14px;color:#888;white-space:nowrap;">до &#8381;</span>' +
           '<input type="number" placeholder="сумма корзины" value="' + basketPriceTo + '" ' +
             'style="width:130px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-to>' +
@@ -563,20 +713,28 @@
             'style="width:110px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:16px;" data-sz-grad-price>' +
           '<button type="button" style="padding:6px 12px;border:none;background:#e74c3c;color:#fff;border-radius:6px;cursor:pointer;font-size:15px;" data-sz-grad-del>&#10005;</button>';
       }
-      row.querySelector('[data-sz-grad-del]').addEventListener('click', () => row.remove());
+      topRow.querySelector('[data-sz-grad-del]').addEventListener('click', () => row.remove());
+      row.appendChild(topRow);
+
+      const productPicker = buildProductPicker(projectId, { currentRef: productRef, currentTitle: productTitle });
+      productPicker.setAttribute('data-sz-grad-product-picker', '1');
+      row.appendChild(productPicker);
+
       table.appendChild(row);
     }
 
     for (const r of rows) {
       const rowCompType = (r.compensation?.compensationType ?? defaultCompType);
-      addRow(r.basketPriceTo, r.price, rowCompType, r.compensation?.compensationValue);
+      const productRef = r.deliveryProduct?._ref || '';
+      const productTitle = productRef ? (mealNameMap?.[productRef] || productRef) : '';
+      addRow(r.basketPriceTo, r.price, rowCompType, r.compensation?.compensationValue, productRef, productTitle);
     }
 
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.textContent = '+ Добавить ступень';
     addBtn.style.cssText = 'margin-top:8px;padding:8px 14px;border:1px dashed #4a90e2;background:transparent;color:#4a90e2;border-radius:6px;cursor:pointer;font-size:14px;';
-    addBtn.addEventListener('click', () => addRow(undefined, undefined, defaultCompType, undefined));
+    addBtn.addEventListener('click', () => addRow(undefined, undefined, defaultCompType, undefined, '', ''));
 
     wrap.appendChild(table);
     wrap.appendChild(addBtn);
@@ -589,6 +747,8 @@
     for (const row of rows) {
       const to = parseFloat(row.querySelector('[data-sz-grad-to]')?.value);
       if (isNaN(to)) continue;
+      const productRef = row.querySelector('[data-sz-grad-product-picker]')?.dataset.productRef || '';
+      const deliveryProduct = productRef ? { _type: 'reference', _weak: true, _ref: productRef } : undefined;
       if (dynamicCalc) {
         const typeEl  = row.querySelector('[data-sz-grad-comp-type]');
         const valueEl = row.querySelector('[data-sz-grad-comp-value]');
@@ -598,21 +758,68 @@
         let rawMap = {};
         try { rawMap = JSON.parse(typeEl.getAttribute('data-sz-raw-map') || '{}'); } catch (e) { /* ignore */ }
         const compensationType = rawMap[selectedKey];
-        result.push({
+        const item = {
           _key: newKey(),
           _type: 'deliveryPrice',
           basketPriceTo: to,
           compensation: { _type: 'compensation', compensationType, compensationValue: value }
-        });
+        };
+        if (deliveryProduct) item.deliveryProduct = deliveryProduct;
+        result.push(item);
       } else {
         const price = parseFloat(row.querySelector('[data-sz-grad-price]')?.value);
-        if (!isNaN(price)) result.push({ _key: newKey(), _type: 'deliveryPrice', basketPriceTo: to, price });
+        if (!isNaN(price)) {
+          const item = { _key: newKey(), _type: 'deliveryPrice', basketPriceTo: to, price };
+          if (deliveryProduct) item.deliveryProduct = deliveryProduct;
+          result.push(item);
+        }
       }
     }
     return result;
   }
 
-  function buildDeliveryTypeSection(label, dtpData, isCollapsed) {
+  // Проверяет перед применением, что для каждой платной (!= 0) цены — что цены по
+  // умолчанию, что ступени градации — выбрано блюдо из каталога ("Позиция для
+  // доставки из POS-системы"). Sanity требует это для платной доставки, поэтому
+  // блокируем применение целиком, если что-то пропущено, вместо того чтобы уйти
+  // в Studio с ошибкой валидации уже после отправки.
+  function collectMissingProductWarnings(modal, allTypeNames) {
+    const missing = [];
+    for (const typeName of allTypeNames) {
+      const section = modal.querySelector(`[data-sz-section="${typeName}"]`);
+      if (!section) continue;
+      const dynamicCalc    = section.getAttribute('data-sz-dynamic-calc') === '1';
+      const priceFieldName = section.getAttribute('data-sz-price-field') || 'defaultDeliveryPrice';
+
+      const priceIncludeCb = section.querySelector(`[data-sz-include="${priceFieldName}"]`);
+      if (priceIncludeCb?.checked) {
+        const val = parseFloat(section.querySelector(`[data-sz-field="${priceFieldName}"]`)?.value);
+        const ref = section.querySelector('[data-sz-default-product-picker]')?.dataset.productRef || '';
+        if (!isNaN(val) && val > 0 && !ref) {
+          missing.push(`${typeName} — «Цена по умолчанию» ${val}₽: не выбрано блюдо из каталога`);
+        }
+      }
+
+      const includeGrad = section.querySelector('[data-sz-include-grad]')?.checked === true;
+      if (includeGrad) {
+        const rows = section.querySelectorAll('[data-sz-grad-table] > div');
+        for (const row of rows) {
+          const to = parseFloat(row.querySelector('[data-sz-grad-to]')?.value);
+          if (isNaN(to)) continue;
+          const val = dynamicCalc
+            ? parseFloat(row.querySelector('[data-sz-grad-comp-value]')?.value)
+            : parseFloat(row.querySelector('[data-sz-grad-price]')?.value);
+          const ref = row.querySelector('[data-sz-grad-product-picker]')?.dataset.productRef || '';
+          if (!isNaN(val) && val > 0 && !ref) {
+            missing.push(`${typeName} — ступень до ${to}₽ (значение ${val}): не выбрано блюдо из каталога`);
+          }
+        }
+      }
+    }
+    return missing;
+  }
+
+  function buildDeliveryTypeSection(label, dtpData, isCollapsed, projectId, mealNameMap) {
     const section = document.createElement('div');
     section.style.cssText = 'margin-top:10px;';
     const dynamicCalc  = dtpData?.dynamicCalc === true;
@@ -674,9 +881,20 @@
         <span>Градация цен <span style="color:#888;">(пустая таблица при включённой галочке = очистить градацию)</span></span>
       </label>
     `;
+
+    const priceInputEl = content.querySelector(`[data-sz-field="${priceFieldName}"]`);
+    const priceLabelEl = priceInputEl?.closest('label');
+    if (priceLabelEl) {
+      const defaultProductRef   = dtpData?.deliveryProduct?._ref || '';
+      const defaultProductTitle = defaultProductRef ? (mealNameMap?.[defaultProductRef] || defaultProductRef) : '';
+      const defaultProductPicker = buildProductPicker(projectId, { currentRef: defaultProductRef, currentTitle: defaultProductTitle });
+      defaultProductPicker.setAttribute('data-sz-default-product-picker', '1');
+      priceLabelEl.appendChild(defaultProductPicker);
+    }
+
     const gradWrap = document.createElement('div');
     gradWrap.setAttribute('data-sz-grad-wrap', '1');
-    gradWrap.appendChild(buildGradationEditor(existingGrad, dynamicCalc, dtpData?.compensation?.compensationType));
+    gradWrap.appendChild(buildGradationEditor(existingGrad, dynamicCalc, dtpData?.compensation?.compensationType, projectId, mealNameMap));
     content.appendChild(gradWrap);
 
     content.appendChild(buildPaymentTypesEditor(dtpData?.paymentTypes));
@@ -739,6 +957,17 @@
       if (name) dtpByName[name] = dtp;
     }
 
+    const mealRefs = new Set();
+    for (const dtp of Object.values(dtpByName)) {
+      if (dtp.deliveryProduct?._ref) mealRefs.add(dtp.deliveryProduct._ref);
+      for (const gradation of (dtp.deliveryPrice || [])) {
+        if (gradation.deliveryProduct?._ref) mealRefs.add(gradation.deliveryProduct._ref);
+      }
+    }
+    let mealNameMap = {};
+    try { mealNameMap = await resolveMealNames(projectId, [...mealRefs]); }
+    catch (e) { /* не критично — просто покажем id вместо названия блюда */ }
+
     const allTypeNames = [...new Set(Object.values(typeNameMap))].sort((a, b) => {
       if (a === 'Доставка') return -1;
       if (b === 'Доставка') return 1;
@@ -777,7 +1006,7 @@
     modal.appendChild(subtitle);
 
     for (let i = 0; i < allTypeNames.length; i++) {
-      modal.appendChild(buildDeliveryTypeSection(allTypeNames[i], dtpByName[allTypeNames[i]] || null, allTypeNames[i] !== 'Доставка'));
+      modal.appendChild(buildDeliveryTypeSection(allTypeNames[i], dtpByName[allTypeNames[i]] || null, allTypeNames[i] !== 'Доставка', projectId, mealNameMap));
     }
 
     // --- БЛОК МАССОВОГО ПРИМЕНЕНИЯ ---
@@ -1046,6 +1275,16 @@
     }
 
     applyBtn.addEventListener('click', () => {
+      const missingProducts = collectMissingProductWarnings(modal, allTypeNames);
+      if (missingProducts.length > 0) {
+        showToast(
+          '⛔ Нельзя применить — для платной доставки обязательно нужно указать блюдо из каталога:\n' +
+          missingProducts.map(w => `• ${w}`).join('\n') +
+          '\n\nОткройте 🔍 у соответствующего поля и выберите блюдо.',
+          'error', 15000
+        );
+        return;
+      }
       const isMassApply  = massToggle.checked;
       const autoPublish  = autoPublishCb.checked;
       const forcePublish = forcePublishCb.checked;
@@ -1135,6 +1374,16 @@
         if (entry[key] === undefined || isNaN(entry[key])) delete entry[key];
       }
 
+      // "Позиция для доставки из POS-системы" для цены по умолчанию идёт в паре с
+      // самой ценой — сохраняем её выбор, только если галочка цены по умолчанию
+      // включена. null означает "снять ссылку" (явно нажали ✕ в поиске блюда) —
+      // применяющий код ниже превращает такие поля в unset вместо set.
+      const priceIncludeCb = section.querySelector(`[data-sz-include="${priceFieldName}"]`);
+      if (priceIncludeCb?.checked) {
+        const productRef = section.querySelector('[data-sz-default-product-picker]')?.dataset.productRef || '';
+        entry.deliveryProduct = productRef ? { _type: 'reference', _weak: true, _ref: productRef } : null;
+      }
+
       const includeGrad = section.querySelector('[data-sz-include-grad]')?.checked === true;
       if (includeGrad) {
         const gradWrap = section.querySelector('[data-sz-grad-wrap]');
@@ -1189,8 +1438,15 @@
             if (!change) continue;
             const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
             const setFields = {};
-            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
-            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+            const unsetPaths = [];
+            for (const key of Object.keys(change)) {
+              if (change[key] === null) unsetPaths.push(`${path}.${key}`);
+              else setFields[`${path}.${key}`] = change[key];
+            }
+            const dtpPatch = {};
+            if (Object.keys(setFields).length > 0) dtpPatch.set = setFields;
+            if (unsetPaths.length > 0) dtpPatch.unset = unsetPaths;
+            if (dtpPatch.set || dtpPatch.unset) mutations.push({ patch: { id: draftId, ...dtpPatch } });
 
             const meta = typeMeta[typeName];
             if (meta) priceWarnings.push(...collectPriceWarnings(zone.name, typeName, dtp, change, meta.priceFieldName, meta.dynamicCalc));
@@ -1352,9 +1608,15 @@
             appliedTypes.add(typeName);
             const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices[_key=="${dtp._key}"]`;
             const setFields = {};
-            for (const key of Object.keys(change)) setFields[`${path}.${key}`] = change[key];
-
-            if (Object.keys(setFields).length > 0) mutations.push({ patch: { id: draftId, set: setFields } });
+            const unsetPaths = [];
+            for (const key of Object.keys(change)) {
+              if (change[key] === null) unsetPaths.push(`${path}.${key}`);
+              else setFields[`${path}.${key}`] = change[key];
+            }
+            const dtpPatch = {};
+            if (Object.keys(setFields).length > 0) dtpPatch.set = setFields;
+            if (unsetPaths.length > 0) dtpPatch.unset = unsetPaths;
+            if (dtpPatch.set || dtpPatch.unset) mutations.push({ patch: { id: draftId, ...dtpPatch } });
           }
         }
 
