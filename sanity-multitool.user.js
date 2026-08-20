@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.11
+// @version      7.12
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами) и «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -478,6 +478,7 @@
       #sz-fab:hover { background: var(--smt-accent-hover); }
       .sz-icon { display: inline-flex; flex-shrink: 0; }
       .sz-icon svg { width: 14px; height: 14px; display: block; }
+      .sz-icon--lg svg { width: 20px; height: 20px; }
     `;
     document.head.appendChild(style);
   }
@@ -1975,8 +1976,8 @@
       font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     `;
     const title = document.createElement('div');
-    title.style.cssText = 'font-size:22px;font-weight:700;margin-bottom:6px;color:var(--smt-text-primary);padding-right:140px;';
-    title.textContent = '🗂 Управление зонами';
+    title.style.cssText = 'font-size:22px;font-weight:700;margin-bottom:6px;color:var(--smt-text-primary);padding-right:140px;display:flex;align-items:center;gap:8px;';
+    title.innerHTML = `<span class="sz-icon sz-icon--lg" style="color:var(--smt-accent);">${NAV_ICON_SVG}</span> Управление зонами`;
     const subtitle = document.createElement('div');
     subtitle.style.cssText = 'font-size:15px;color:var(--smt-text-tertiary);margin-bottom:18px;';
     subtitle.textContent = 'Условия доставки, копирование зон между ресторанами, способы оплаты';
