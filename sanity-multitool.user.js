@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.10
+// @version      7.11
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами) и «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -476,6 +476,8 @@
         box-shadow: 0 6px 18px var(--smt-accent-shadow);
       }
       #sz-fab:hover { background: var(--smt-accent-hover); }
+      .sz-icon { display: inline-flex; flex-shrink: 0; }
+      .sz-icon svg { width: 14px; height: 14px; display: block; }
     `;
     document.head.appendChild(style);
   }
@@ -2463,11 +2465,17 @@
     return parts[2].startsWith('shops-item;shops');
   }
 
+  // Иконка кнопки — currentColor, viewBox обрезан вплотную к фигуре (у
+  // исходника был 1px пустого поля сверху/снизу в 16×16, здесь срезано до
+  // фактических границ 16×14, см. modal-style-guide/icons.md про то, почему
+  // это важно на мелком масштабе).
+  const NAV_ICON_SVG = '<svg viewBox="0 1 16 14" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M4 2L0 1V14L4 15V2Z" fill="currentColor"/><path d="M16 2L12 1V14L16 15V2Z" fill="currentColor"/><path d="M10 1L6 2V15L10 14V1Z" fill="currentColor"/></svg>';
+
   function createNavButton() {
     const btn = document.createElement('button');
     btn.id = 'sz-nav-btn';
     btn.type = 'button';
-    btn.textContent = '🗂 Управление зонами';
+    btn.innerHTML = `<span class="sz-icon">${NAV_ICON_SVG}</span> Управление зонами`;
     btn.addEventListener('click', () => openZonesHub(getShopId()));
     return btn;
   }
@@ -2476,7 +2484,7 @@
     const btn = document.createElement('button');
     btn.id = 'sz-fab';
     btn.type = 'button';
-    btn.textContent = '🗂 Управление зонами';
+    btn.innerHTML = `<span class="sz-icon">${NAV_ICON_SVG}</span> Управление зонами`;
     btn.addEventListener('click', () => openZonesHub(getShopId()));
     return btn;
   }
