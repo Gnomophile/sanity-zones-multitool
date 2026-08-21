@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.12
+// @version      7.13
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами) и «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -1069,7 +1069,7 @@
       }
       const searchBox = document.createElement('input');
       searchBox.type = 'text';
-      searchBox.placeholder = 'Поиск по названию ресторана...';
+      searchBox.placeholder = 'Поиск по названию или адресу...';
       searchBox.style.cssText = 'width:100%; padding:8px; margin-bottom:10px; border:1px solid var(--smt-border); border-radius:6px; box-sizing:border-box; font-family:inherit; background:var(--smt-bg-panel); color:var(--smt-text-primary);';
       container.appendChild(searchBox);
 
@@ -1092,10 +1092,14 @@
       for (const shop of shops) {
         const zones = shop.zones || [];
         const preselectedKeys = (opts.preselected && opts.preselected[shop._id]) || [];
+        const addressStr = `${shop.address?.street?.ru || ''} ${shop.address?.house?.ru || ''}`.trim();
         const shopDetails = document.createElement('details');
         shopDetails.className = 'smt-shop-block';
         shopDetails.setAttribute('data-sz-shop-block', shop._id);
-        shopDetails.dataset.shopName = (shop.name?.ru || '').toLowerCase();
+        // Ищем и по названию, и по адресу — у многих сетей все точки называются
+        // одинаково («FRENCH BAKERY SeDelice ×20»), различаются только адресом,
+        // без него найти нужную в списке практически невозможно.
+        shopDetails.dataset.shopName = `${shop.name?.ru || ''} ${addressStr}`.toLowerCase();
         if (preselectedKeys.length > 0 || shop._id === opts.autoExpandShopId) shopDetails.open = true;
 
         const summary = document.createElement('summary');
@@ -1130,7 +1134,6 @@
         }
 
         const labelSpan = document.createElement('span');
-        const addressStr = `${shop.address?.street?.ru || ''} ${shop.address?.house?.ru || ''}`.trim();
         labelSpan.textContent = `${shop.name?.ru || shop._id}${addressStr ? ' (' + addressStr + ')' : ''} — ${zones.length} ${zones.length === 1 ? 'зона' : 'зон'}`;
         labelSpan.style.cssText = (zones.length === 0 && !opts.shopLevelOnly) ? 'color:var(--smt-text-tertiary);' : '';
 
