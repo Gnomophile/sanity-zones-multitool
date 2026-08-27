@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.13
+// @version      7.14
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами) и «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -736,9 +736,23 @@
     wrap.dataset.productTitle = opts.currentTitle || '';
     wrap.style.cssText = 'margin-top:6px;';
 
-    const label = document.createElement('div');
-    label.textContent = 'Позиция для доставки из POS-системы';
-    label.style.cssText = 'font-size:12px;color:var(--smt-text-tertiary);margin-bottom:4px;';
+    // opts.includeCheckbox — показать свою галочку «копировать позицию» в подписи.
+    // Нужна для дефолтного пикера во вкладке «Условия»: раньше позицию можно было
+    // скопировать только вместе с ценой, а сам пикер лежал внутри <label> цены,
+    // из-за чего выбор блюда переключал галочку «Цена по умолчанию».
+    const label = document.createElement(opts.includeCheckbox ? 'label' : 'div');
+    label.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;color:var(--smt-text-tertiary);margin-bottom:4px;'
+      + (opts.includeCheckbox ? 'cursor:pointer;' : '');
+    if (opts.includeCheckbox) {
+      const incCb = document.createElement('input');
+      incCb.type = 'checkbox';
+      incCb.setAttribute('data-sz-include-product', '1');
+      incCb.style.cssText = 'width:15px;height:15px;cursor:pointer;accent-color:var(--smt-accent);';
+      label.appendChild(incCb);
+      label.appendChild(document.createTextNode('Позиция для доставки из POS-системы'));
+    } else {
+      label.textContent = 'Позиция для доставки из POS-системы';
+    }
     wrap.appendChild(label);
 
     const chipRow = document.createElement('div');
@@ -1461,9 +1475,12 @@
     if (priceLabelEl) {
       const defaultProductRef   = dtpData?.deliveryProduct?._ref || '';
       const defaultProductTitle = defaultProductRef ? (mealNameMap?.[defaultProductRef] || defaultProductRef) : '';
-      const defaultProductPicker = buildProductPicker(projectId, { currentRef: defaultProductRef, currentTitle: defaultProductTitle });
+      const defaultProductPicker = buildProductPicker(projectId, { currentRef: defaultProductRef, currentTitle: defaultProductTitle, includeCheckbox: true });
       defaultProductPicker.setAttribute('data-sz-default-product-picker', '1');
-      priceLabelEl.appendChild(defaultProductPicker);
+      // Не внутрь <label> цены, а отдельной строкой под ней — иначе клики по
+      // пикеру переключают галочку «Цена по умолчанию».
+      defaultProductPicker.style.gridColumn = '1 / -1';
+      priceLabelEl.after(defaultProductPicker);
     }
 
     const gradWrap = document.createElement('div');
@@ -1475,7 +1492,7 @@
 
     const selectAllFieldsCb = content.querySelector('[data-sz-select-all-fields]');
     selectAllFieldsCb.addEventListener('change', () => {
-      content.querySelectorAll('[data-sz-include], [data-sz-include-grad], [data-sz-include-payment]').forEach(cb => {
+      content.querySelectorAll('[data-sz-include], [data-sz-include-grad], [data-sz-include-payment], [data-sz-include-product]').forEach(cb => {
         cb.checked = selectAllFieldsCb.checked;
       });
     });
@@ -1525,8 +1542,9 @@
         if (entry[key] === undefined || isNaN(entry[key])) delete entry[key];
       }
 
-      const priceIncludeCb = section.querySelector(`[data-sz-include="${priceFieldName}"]`);
-      if (priceIncludeCb?.checked) {
+      const priceIncludeCb   = section.querySelector(`[data-sz-include="${priceFieldName}"]`);
+      const productIncludeCb = section.querySelector('[data-sz-include-product]');
+      if (priceIncludeCb?.checked || productIncludeCb?.checked) {
         const productRef = section.querySelector('[data-sz-default-product-picker]')?.dataset.productRef || '';
         entry.deliveryProduct = productRef ? { _type: 'reference', _weak: true, _ref: productRef } : null;
       }
