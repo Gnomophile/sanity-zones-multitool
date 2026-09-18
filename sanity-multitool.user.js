@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.14
-// @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами) и «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
+// @version      7.16
+// @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами), «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка) и «Способы получения» (массовое добавление самовывоза/приёма в зале в первую и первую активную зону ресторана), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
 // @run-at       document-start
@@ -143,6 +143,24 @@
     const { documents } = await r.json();
     const map = {};
     for (const d of documents) map[d._id] = d.name?.ru || d.title?.ru || d._id;
+    return map;
+  }
+
+  // Находит документы каталога "способы получения" (deliveryType) по их
+  // служебному коду (поле type: "pickup"/"indoor"/"courier" — фиксированный
+  // enum схемы, одинаковый во всех проектах), а не по названию, так как
+  // название редактируется руками и не гарантированно совпадает с ожидаемым.
+  // Нужен для вкладки «Способы получения», где новый deliveryTypePrices
+  // создаётся с нуля и требует ссылку на этот общий каталожный документ.
+  async function fetchDeliveryTypeRefs(projectId, types) {
+    const query = encodeURIComponent(
+      `*[_type == "deliveryType" && type in [${types.map(t => JSON.stringify(t)).join(',')}]]{_id, type, "name": name.ru}`
+    );
+    const r = await apiFetch(projectId, `/data/query/production?query=${query}`);
+    if (!r.ok) throw new Error('не удалось загрузить каталог способов получения');
+    const { result } = await r.json();
+    const map = {};
+    for (const d of (result || [])) map[d.type] = { ref: d._id, name: d.name || d.type };
     return map;
   }
 
@@ -684,16 +702,12 @@
     { value: 'google',        label: 'Google Pay' }
   ];
 
-  function buildPaymentTypesEditor(currentValues) {
-    const wrap = document.createElement('div');
-    wrap.setAttribute('data-sz-payment-types', '1');
-    wrap.style.cssText = 'margin-top:14px;';
-    const title = document.createElement('label');
-    title.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:var(--smt-text-secondary);margin-bottom:8px;cursor:pointer;';
-    title.innerHTML = '<input type="checkbox" data-sz-include-payment style="width:15px;height:15px;cursor:pointer;accent-color:var(--smt-accent);"> Типы оплаты';
-    wrap.appendChild(title);
-
+  // Сетка чекбоксов способов оплаты — общая часть для вкладки «Условия»
+  // (buildPaymentTypesEditor, с обёрткой «включить копирование поля») и
+  // вкладки «Способы получения» (без обёртки, поле обязательно всегда).
+  function buildPaymentTypesGrid(currentValues) {
     const grid = document.createElement('div');
+    grid.setAttribute('data-sz-payment-grid', '1');
     grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;';
     const known = new Set(currentValues || []);
     for (const pt of PAYMENT_TYPES) {
@@ -710,18 +724,38 @@
       label.appendChild(span);
       grid.appendChild(label);
     }
-    wrap.appendChild(grid);
+    return grid;
+  }
+
+  function readPaymentTypesGrid(grid) {
+    if (!grid) return [];
+    return Array.from(grid.querySelectorAll('input[data-sz-payment-value]'))
+      .filter(cb => cb.checked)
+      .map(cb => cb.getAttribute('data-sz-payment-value'));
+  }
+
+  function buildPaymentTypesEditor(currentValues) {
+    const wrap = document.createElement('div');
+    wrap.setAttribute('data-sz-payment-types', '1');
+    wrap.style.cssText = 'margin-top:14px;';
+    const title = document.createElement('label');
+    title.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:var(--smt-text-secondary);margin-bottom:8px;cursor:pointer;';
+    title.innerHTML = '<input type="checkbox" data-sz-include-payment style="width:15px;height:15px;cursor:pointer;accent-color:var(--smt-accent);"> Типы оплаты';
+    wrap.appendChild(title);
+    wrap.appendChild(buildPaymentTypesGrid(currentValues));
     return wrap;
   }
 
   function readPaymentTypes(container) {
     const wrap = container.querySelector('[data-sz-payment-types]');
     if (!wrap) return null;
-    const checked = Array.from(wrap.querySelectorAll('input[data-sz-payment-value]'))
-      .filter(cb => cb.checked)
-      .map(cb => cb.getAttribute('data-sz-payment-value'));
-    return checked;
+    return readPaymentTypesGrid(wrap.querySelector('[data-sz-payment-grid]'));
   }
+
+  const FULFILLMENT_METHODS = [
+    { value: 'pickup', label: 'Самовывоз' },
+    { value: 'indoor', label: 'В зале' }
+  ];
 
   // Виджет выбора "Позиции для доставки из POS-системы" — обязательного блюда из
   // каталога, которое Sanity требует указывать, когда доставка платная (цена по
@@ -1087,16 +1121,26 @@
       searchBox.style.cssText = 'width:100%; padding:8px; margin-bottom:10px; border:1px solid var(--smt-border); border-radius:6px; box-sizing:border-box; font-family:inherit; background:var(--smt-bg-panel); color:var(--smt-text-primary);';
       container.appendChild(searchBox);
 
-      // Без уровня зон разворачивать нечего — ссылки в этом режиме были бы
-      // рабочими, но бессмысленными (нечего показывать), поэтому не рисуем.
+      // Разворачивать без уровня зон нечего — ссылка была бы рабочей, но
+      // бессмысленной (нечего показывать), поэтому её не рисуем при
+      // shopLevelOnly. "Выбрать все рестораны", наоборот, не рисуем только при
+      // singleSelect — там на всё дерево разрешена ровно одна зона, "выбрать
+      // все" там физически невозможно.
+      const showExpandCollapse = !opts.shopLevelOnly;
+      const showSelectAll = !opts.singleSelect;
       let globalActions = null;
-      if (!opts.shopLevelOnly) {
+      if (showExpandCollapse || showSelectAll) {
         globalActions = document.createElement('div');
-        globalActions.style.cssText = 'display:flex; gap:14px; margin-bottom:8px; font-size:13px;';
-        globalActions.innerHTML = `
-          <a href="#" data-sz-expand-all style="color:var(--smt-accent); text-decoration:none;">Развернуть все</a>
-          <a href="#" data-sz-collapse-all style="color:var(--smt-accent); text-decoration:none;">Свернуть все</a>
-        `;
+        globalActions.style.cssText = 'display:flex; gap:14px; margin-bottom:8px; font-size:13px; flex-wrap:wrap;';
+        globalActions.innerHTML =
+          (showSelectAll ? `
+            <a href="#" data-sz-select-all style="color:var(--smt-accent); text-decoration:none;">Выбрать все рестораны</a>
+            <a href="#" data-sz-deselect-all style="color:var(--smt-accent); text-decoration:none;">Снять выбор</a>
+          ` : '') +
+          (showExpandCollapse ? `
+            <a href="#" data-sz-expand-all style="color:var(--smt-accent); text-decoration:none;">Развернуть все</a>
+            <a href="#" data-sz-collapse-all style="color:var(--smt-accent); text-decoration:none;">Свернуть все</a>
+          ` : '');
         container.appendChild(globalActions);
       }
 
@@ -1156,7 +1200,24 @@
         summary.appendChild(labelSpan);
         shopDetails.appendChild(summary);
 
+        // Клик по любому месту строки (не только по самому чекбоксу) отмечает
+        // ресторан — раскрытие/сворачивание зон переехало на отдельную стрелку
+        // ▸, чтобы эти два действия не мешали друг другу на одном клике.
+        if (shopAllCb) {
+          summary.addEventListener('click', e => {
+            if (shopAllCb.disabled) return;
+            e.preventDefault();
+            shopAllCb.checked = !shopAllCb.checked;
+            shopAllCb.dispatchEvent(new Event('change'));
+          });
+        }
+
         if (isExpandable) {
+          chevron.addEventListener('click', e => {
+            e.stopPropagation();
+            e.preventDefault();
+            shopDetails.open = !shopDetails.open;
+          });
           shopDetails.addEventListener('toggle', () => {
             chevron.style.transform = shopDetails.open ? 'rotate(90deg)' : 'rotate(0deg)';
           });
@@ -1204,6 +1265,19 @@
               zSummary.appendChild(zCb);
               zSummary.appendChild(zSpan);
               zoneDetails.appendChild(zSummary);
+
+              // Тот же приём, что и у строки ресторана выше: клик по строке
+              // отмечает зону, раскрытие способов получения — только по стрелке.
+              zChevron.addEventListener('click', e => {
+                e.stopPropagation();
+                e.preventDefault();
+                zoneDetails.open = !zoneDetails.open;
+              });
+              zSummary.addEventListener('click', e => {
+                e.preventDefault();
+                zCb.checked = !zCb.checked;
+                zCb.dispatchEvent(new Event('change'));
+              });
               zoneDetails.addEventListener('toggle', () => {
                 zChevron.style.transform = zoneDetails.open ? 'rotate(90deg)' : 'rotate(0deg)';
               });
@@ -1293,14 +1367,32 @@
         });
       });
       if (globalActions) {
-        globalActions.querySelector('[data-sz-expand-all]').addEventListener('click', e => {
+        const expandAllLink   = globalActions.querySelector('[data-sz-expand-all]');
+        const collapseAllLink = globalActions.querySelector('[data-sz-collapse-all]');
+        if (expandAllLink) expandAllLink.addEventListener('click', e => {
           e.preventDefault();
           shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = true; });
         });
-        globalActions.querySelector('[data-sz-collapse-all]').addEventListener('click', e => {
+        if (collapseAllLink) collapseAllLink.addEventListener('click', e => {
           e.preventDefault();
           shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => { d.open = false; });
         });
+
+        // Затрагивает только рестораны, видимые сейчас (после поиска) — иначе
+        // «выбрать все» незаметно отметило бы и то, что скрыто фильтром.
+        function setAllVisibleShopsChecked(checked) {
+          shopsList.querySelectorAll('details[data-sz-shop-block]').forEach(d => {
+            if (d.style.display === 'none') return;
+            const cb = d.querySelector('input[data-sz-shop-all]');
+            if (!cb || cb.disabled || cb.checked === checked) return;
+            cb.checked = checked;
+            cb.dispatchEvent(new Event('change'));
+          });
+        }
+        const selectAllLink   = globalActions.querySelector('[data-sz-select-all]');
+        const deselectAllLink = globalActions.querySelector('[data-sz-deselect-all]');
+        if (selectAllLink) selectAllLink.addEventListener('click', e => { e.preventDefault(); setAllVisibleShopsChecked(true); });
+        if (deselectAllLink) deselectAllLink.addEventListener('click', e => { e.preventDefault(); setAllVisibleShopsChecked(false); });
       }
     }
 
@@ -1968,6 +2060,120 @@
     return { el };
   }
 
+  // Секция одного способа получения (самовывоз/в зале) на вкладке «Способы
+  // получения»: чекбокс «добавлять» раскрывает активность + типы оплаты.
+  // Оба поля без дефолта по требованию — Sanity не задаёт разумного значения
+  // ни для того, ни для другого, поэтому вместо угадывания оставляем их
+  // невыбранными до тех пор, пока их не проставят вручную.
+  function buildFulfillmentMethodSection(method) {
+    const wrap = document.createElement('div');
+    wrap.setAttribute('data-sz-fulfillment-method', method.value);
+    wrap.style.cssText = 'margin-top:14px;padding:16px;background:var(--smt-bg-subtle);border-radius:8px;border:1px solid var(--smt-border);';
+
+    const headLabel = document.createElement('label');
+    headLabel.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;color:var(--smt-text-primary);cursor:pointer;';
+    headLabel.innerHTML = `<input type="checkbox" data-sz-fulfillment-include style="width:17px;height:17px;cursor:pointer;accent-color:var(--smt-accent);"> ${method.label}`;
+    wrap.appendChild(headLabel);
+
+    const body = document.createElement('div');
+    body.setAttribute('data-sz-fulfillment-body', '1');
+    body.style.cssText = 'margin-top:12px;display:none;';
+
+    const activeLabel = document.createElement('label');
+    activeLabel.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:var(--smt-text-primary);margin-bottom:14px;cursor:pointer;';
+    activeLabel.innerHTML = '<input type="checkbox" data-sz-fulfillment-active style="width:16px;height:16px;cursor:pointer;accent-color:var(--smt-accent);"> Активен сразу после добавления';
+    body.appendChild(activeLabel);
+
+    const paymentTitle = document.createElement('div');
+    paymentTitle.style.cssText = 'font-size:14px;color:var(--smt-text-secondary);margin-bottom:8px;';
+    paymentTitle.textContent = 'Типы оплаты';
+    body.appendChild(paymentTitle);
+    body.appendChild(buildPaymentTypesGrid([]));
+
+    wrap.appendChild(body);
+
+    headLabel.querySelector('[data-sz-fulfillment-include]').addEventListener('change', e => {
+      body.style.display = e.target.checked ? 'block' : 'none';
+    });
+
+    return wrap;
+  }
+
+  // Вкладка «Способы получения»: добавляет самовывоз и/или приём в зале как
+  // НОВЫЕ способы получения (deliveryTypePrices) — не редактирует уже
+  // существующие. Добавляет только в первую по списку зону ресторана и в
+  // первую АКТИВНУЮ зону (иногда это одна и та же зона, тогда добавление
+  // одно, а не два) — остальные зоны эти способы получения не затрагивает.
+  // Время доставки, мин. сумма корзины и цена по умолчанию всегда 0;
+  // активность и типы оплаты каждого способа задаются вручную в модалке
+  // перед массовой вставкой (см. buildFulfillmentMethodSection).
+  function buildFulfillmentTab(projectId, initialShopId, overlay) {
+    const el = document.createElement('div');
+
+    const methodsHeading = document.createElement('div');
+    methodsHeading.style.cssText = 'font-size:14px;font-weight:600;color:var(--smt-text-primary);margin-bottom:6px;';
+    methodsHeading.textContent = 'Какие способы получения добавить';
+    el.appendChild(methodsHeading);
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:13px;color:var(--smt-text-tertiary);margin-bottom:10px;';
+    hint.textContent = 'Добавляются как новые — если такой способ получения в зоне уже есть, она пропускается. Затрагивает только первую по списку зону и первую активную зону ресторана (иногда это одна и та же зона).';
+    el.appendChild(hint);
+
+    const sections = {};
+    for (const m of FULFILLMENT_METHODS) {
+      const section = buildFulfillmentMethodSection(m);
+      sections[m.value] = section;
+      el.appendChild(section);
+    }
+
+    const targetHeading = document.createElement('div');
+    targetHeading.style.cssText = 'font-size:14px;font-weight:600;color:var(--smt-text-primary);margin-top:22px;margin-bottom:6px;';
+    targetHeading.textContent = 'В каких ресторанах';
+    el.appendChild(targetHeading);
+
+    const targetTree = buildShopZoneTree(projectId, {
+      shopLevelOnly: true,
+      autoExpandShopId: initialShopId || undefined,
+      hint: 'Зона выбирается автоматически (первая по списку и первая активная) — здесь отмечайте только рестораны.',
+      onChange: () => footer.syncDangerBanner()
+    });
+    el.appendChild(targetTree.el);
+    if (initialShopId) targetTree.load();
+
+    function readSelectedMethods() {
+      return FULFILLMENT_METHODS
+        .filter(m => sections[m.value].querySelector('[data-sz-fulfillment-include]').checked)
+        .map(m => ({
+          value: m.value,
+          label: m.label,
+          active: sections[m.value].querySelector('[data-sz-fulfillment-active]').checked,
+          paymentTypes: readPaymentTypesGrid(sections[m.value].querySelector('[data-sz-payment-grid]'))
+        }));
+    }
+
+    const footer = buildApplyOptionsFooter({
+      applyLabel: '🚗 Добавить способы получения',
+      getShopCount: () => Object.keys(targetTree.getSelection()).length,
+      beforeApply: () => {
+        if (readSelectedMethods().length === 0) {
+          showToast('Отметьте хотя бы один способ получения для добавления', 'warning');
+          return false;
+        }
+        return true;
+      },
+      onApply: (state) => {
+        const selectedMethods = readSelectedMethods();
+        const targetShopIds = Object.keys(targetTree.getSelection());
+        overlay.remove();
+        applyFulfillmentMethods(projectId, targetShopIds, selectedMethods, state);
+      }
+    });
+    el.appendChild(footer.el);
+
+    return { el };
+  }
+
   // Хаб-модалка «Управление зонами» — единая точка входа вместо трёх отдельных
   // кнопок в шапке ресторана. Ресторан(ы)/зоны выбираются внутри самой модалки
   // (переиспользуемым деревом buildShopZoneTree), а не через уже открытую
@@ -2001,7 +2207,7 @@
     title.innerHTML = `<span class="sz-icon sz-icon--lg" style="color:var(--smt-accent);">${NAV_ICON_SVG}</span> Управление зонами`;
     const subtitle = document.createElement('div');
     subtitle.style.cssText = 'font-size:15px;color:var(--smt-text-tertiary);margin-bottom:18px;';
-    subtitle.textContent = 'Условия доставки, копирование зон между ресторанами, способы оплаты';
+    subtitle.textContent = 'Условия доставки, копирование зон между ресторанами, способы оплаты и получения';
 
     const headerControls = document.createElement('div');
     headerControls.style.cssText = 'position:absolute;top:20px;right:22px;display:flex;align-items:center;gap:10px;';
@@ -2017,9 +2223,10 @@
     headerControls.appendChild(closeBtn);
 
     const modes = [
-      { key: 'conditions', label: 'Условия' },
-      { key: 'copy',       label: 'Копирование зон' },
-      { key: 'payments',   label: 'Способы оплаты' }
+      { key: 'conditions',   label: 'Условия' },
+      { key: 'copy',         label: 'Копирование зон' },
+      { key: 'payments',     label: 'Способы оплаты' },
+      { key: 'fulfillment',  label: 'Способы получения' }
     ];
     const triWrap = document.createElement('div');
     triWrap.className = 'smt-tri';
@@ -2095,9 +2302,10 @@
     function showMode(key) {
       bodyInner.innerHTML = '';
       if (!built[key]) {
-        if (key === 'conditions') built[key] = buildConditionsTab(projectId, initialShopId, overlay);
-        else if (key === 'copy')  built[key] = buildCopyZonesTab(projectId, initialShopId, overlay);
-        else                       built[key] = buildPaymentToggleTab(projectId, initialShopId, overlay);
+        if (key === 'conditions')       built[key] = buildConditionsTab(projectId, initialShopId, overlay);
+        else if (key === 'copy')        built[key] = buildCopyZonesTab(projectId, initialShopId, overlay);
+        else if (key === 'payments')    built[key] = buildPaymentToggleTab(projectId, initialShopId, overlay);
+        else                            built[key] = buildFulfillmentTab(projectId, initialShopId, overlay);
       }
       bodyInner.appendChild(built[key].el);
     }
@@ -2462,6 +2670,197 @@
     if (state.reloadAfter) setTimeout(() => location.reload(), duration + 500);
   }
 
+  // Добавляет новые способы получения (deliveryTypePrices) в первую по списку
+  // и первую активную зону каждого выбранного ресторана. "Первая активная" —
+  // первая зона в deliveryZones, у которой zone.status === true (то же поле,
+  // что переключает тумблер «Активна» в редакторе зоны в Studio); если это та
+  // же зона, что и первая по списку, добавление в неё происходит один раз, а
+  // не дважды. Способ, который в целевой зоне уже есть (совпадает
+  // deliveryType._ref), пропускается — не редактируется и не дублируется.
+  // Общий с applyPaymentToggle/copyZonesToShops скелет (owned-draft, бэкап,
+  // публикация, предполётная проверка валидации).
+  async function applyFulfillmentMethods(projectId, shopIds, methods, state) {
+    if (shopIds.length === 0) { showToast('Нет выбранных ресторанов', 'warning'); return; }
+
+    let typeRefs;
+    try {
+      typeRefs = await fetchDeliveryTypeRefs(projectId, methods.map(m => m.value));
+    } catch (e) {
+      showToast('Ошибка загрузки каталога способов получения: ' + e.message, 'error');
+      return;
+    }
+    const missingCatalog = methods.filter(m => !typeRefs[m.value]);
+    if (missingCatalog.length > 0) {
+      showToast(
+        '⛔ В каталоге «Способы получения» не найдено: ' + missingCatalog.map(m => m.label).join(', ') +
+        '. Создайте способ получения в Studio (раздел «Способы получения») и повторите.',
+        'error', 12000
+      );
+      return;
+    }
+
+    if (state.autoPublish && state.preflightValidation) {
+      const workspace    = currentWorkspace();
+      const originalPath = location.pathname;
+      showToast(`Проверяем валидацию ${shopIds.length} ресторан(ов) перед публикацией...`, 'info', 3000);
+      let invalidShops;
+      try {
+        invalidShops = await checkShopsValidationBeforePublish(workspace, shopIds, originalPath, true);
+      } catch (e) {
+        showToast('Не удалось проверить валидацию: ' + e.message + '. Публикация отменена.', 'error', 15000);
+        return;
+      }
+      if (invalidShops.length > 0) {
+        const list = invalidShops.map(s => `• ${s.shopName}`).join('\n');
+        showToast(`⛔ Публикация заблокирована — не пройдена валидация у:\n${list}\n\nНи один ресторан не был изменён.`, 'error', 20000);
+        return;
+      }
+    }
+
+    let progress = 0;
+    const total = shopIds.length;
+    const addedByShop = {};
+    const alreadyExists = [];
+    const allWarnings = [];
+    const backups = [];
+
+    for (const shopId of shopIds) {
+      progress++;
+      showToast(`Добавляем способы получения: ${progress} из ${total}...`, 'info', 2000);
+      try {
+        const doc = await getDoc(projectId, shopId);
+        if (!doc) { allWarnings.push(`${shopId}: заведение не найдено`); continue; }
+        const shopName = doc.name?.ru || shopId;
+        const zones = doc.deliveryZones || [];
+        if (zones.length === 0) { allWarnings.push(`${shopName}: в ресторане нет зон доставки`); continue; }
+
+        const zoneFirst   = zones[0];
+        const zoneActive  = zones.find(z => z.status === true) || null;
+        const targetZones = (zoneActive && zoneActive._key !== zoneFirst._key) ? [zoneFirst, zoneActive] : [zoneFirst];
+
+        if (state.backupBefore) backups.push({ shopId, shopName: doc.name?.ru || null, zones: targetZones });
+
+        const draftId  = 'drafts.' + shopId;
+        const hasDraft = doc._id.startsWith('drafts.');
+        const ownedRev       = hasDraft ? getOwnedDraftRev(projectId, shopId) : null;
+        const isKnownOwned   = !hasDraft || (ownedRev !== null && ownedRev === doc._rev);
+        const isForeignDraft = hasDraft && !isKnownOwned;
+        const mutations = [];
+        if (!hasDraft) {
+          const { documents } = await (await apiFetch(projectId, `/data/doc/production/${shopId}`)).json();
+          mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
+        }
+
+        const added = [];
+        for (const zone of targetZones) {
+          for (const method of methods) {
+            const ref = typeRefs[method.value].ref;
+            const already = (zone.deliveryTypePrices || []).some(d => d.deliveryType?._ref === ref);
+            if (already) {
+              alreadyExists.push({ shopName, zoneName: zone.name || '(без названия)', methodLabel: method.label });
+              continue;
+            }
+            const newDtp = {
+              _key: newKey(), _type: 'deliveryTypePrice',
+              deliveryType: { _type: 'reference', _ref: ref },
+              deliveryTime: 0, minBasketPrice: 0, defaultDeliveryPrice: 0,
+              dynamicCalc: false, deliveryPrice: [],
+              paymentTypes: method.paymentTypes,
+              status: method.active
+            };
+            const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices`;
+            mutations.push({
+              patch: {
+                id: draftId,
+                setIfMissing: { [path]: [] },
+                insert: { after: `${path}[-1]`, items: [newDtp] }
+              }
+            });
+            added.push(`${method.label} → «${zone.name}»`);
+          }
+        }
+
+        if (added.length === 0) continue;
+
+        const r = await apiFetch(projectId, `/data/mutate/production?returnIds=true&returnDocuments=true`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mutations })
+        });
+        if (!r.ok) {
+          const result = await r.json();
+          allWarnings.push(`${shopName}: ошибка Sanity — ${JSON.stringify(result?.error || result)}`);
+          continue;
+        }
+        const result = await r.json();
+        const draftResult = result.results?.find(x => x.id === draftId);
+        if (isKnownOwned) setOwnedDraftRev(projectId, shopId, draftResult?.document?._rev || null);
+
+        addedByShop[shopId] = { shopName, added, isForeignDraft };
+
+        if (state.autoPublish) {
+          if (isForeignDraft && !state.forcePublish) {
+            addedByShop[shopId].publishSkipped = 'foreign';
+          } else {
+            try {
+              await publishDoc(projectId, shopId);
+              clearOwnedDraftRev(projectId, shopId);
+              addedByShop[shopId].published = true;
+            } catch (e) {
+              addedByShop[shopId].publishError = e.message;
+            }
+          }
+        }
+      } catch (e) {
+        allWarnings.push(`${shopId}: ${e.message}`);
+      }
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (state.backupBefore && backups.length > 0) {
+      downloadJson(backupFilename('sanity-backup_fulfillment-methods'), {
+        createdAt: new Date().toISOString(),
+        projectId,
+        operation: 'add-fulfillment-methods',
+        methods: methods.map(m => m.value),
+        shopsCount: backups.length,
+        shops: backups
+      });
+    }
+
+    const addedEntries = Object.values(addedByShop);
+    let msg, toastType;
+    if (addedEntries.length > 0) {
+      msg = `✅ Добавлено в ${addedEntries.length} из ${total} ресторан(ов):\n`
+        + addedEntries.slice(0, 20).map(a => `• ${a.shopName}: ${a.added.join(', ')}`).join('\n');
+      toastType = 'success';
+    } else {
+      msg = 'Нечего добавлять — способ(ы) получения уже были во всех целевых зонах.';
+      toastType = 'warning';
+    }
+    const skippedPublish = addedEntries.filter(a => a.publishSkipped);
+    if (skippedPublish.length > 0) {
+      msg += `\n\n⏸ Публикация пропущена (${skippedPublish.length}) — есть посторонние неопубликованные изменения`;
+      toastType = 'warning';
+    }
+    // Список зон, где способ получения уже был — по всем ресторанам сразу
+    // (не только по тем, где что-то ещё и добавилось), чтобы сразу было видно,
+    // где ничего дублировать не стали.
+    if (alreadyExists.length > 0) {
+      msg += `\n\nℹ️ Уже было (${alreadyExists.length}) — не дублировали:\n`
+        + alreadyExists.slice(0, 30).map(a => `• ${a.shopName} — «${a.zoneName}»: ${a.methodLabel}`).join('\n');
+      toastType = 'warning';
+    }
+    if (allWarnings.length > 0) {
+      msg += `\n\n⚠️ Предупреждения (${allWarnings.length}):\n` + allWarnings.slice(0, 20).join('\n');
+      toastType = 'warning';
+    }
+    if (!state.autoPublish && addedEntries.length > 0) msg += '\n\nНажмите «Опубликовать» в интерфейсах изменённых ресторанов.';
+    const duration = toastType === 'success' ? 8000 : 15000;
+    showToast(msg, toastType, duration);
+    if (state.reloadAfter) setTimeout(() => location.reload(), duration + 500);
+  }
+
   // ---------------------------------------------------------------------
   // Кнопка вызова хаба в левом меню Studio — там же, где кнопка баннеров
   // в sanity-banners-manager.user.js: ищем пункт меню «Schedules» и вставляем
@@ -2556,3 +2955,4 @@
   }
 
 })();
+
