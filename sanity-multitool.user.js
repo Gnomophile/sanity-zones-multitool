@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.16
+// @version      7.17
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами), «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка) и «Способы получения» (массовое добавление самовывоза/приёма в зале в первую и первую активную зону ресторана), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -628,7 +628,7 @@
         const zonesToAdd = [];
         const skippedHere = [];
         for (const zone of sourceZones) {
-          const newName = `${zone.name} с ${sourceAddress}`;
+          const newName = opts.hideSource ? zone.name : `${zone.name} с ${sourceAddress}`;
           if (targetZones.find(z => z.name === newName)) { skippedHere.push(newName); continue; }
           const clone = deepClone(zone);
           clone.name = newName;
@@ -1930,6 +1930,15 @@
     });
     el.appendChild(targetTree.el);
 
+    const hideSourceWrap = document.createElement('label');
+    hideSourceWrap.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:var(--smt-text-secondary);margin-top:14px;cursor:pointer;';
+    hideSourceWrap.innerHTML = `
+      <input type="checkbox" style="width:16px;height:16px;cursor:pointer;accent-color:var(--smt-accent);" data-sz-hide-source>
+      <span>Не указывать зону-источник в названии <span style="color:var(--smt-text-tertiary);">(иначе к названию добавляется «с адрес-источника». Если в ресторане-цели уже есть зона с таким же названием — она будет пропущена)</span></span>
+    `;
+    el.appendChild(hideSourceWrap);
+    const hideSourceCb = hideSourceWrap.querySelector('[data-sz-hide-source]');
+
     const footer = buildApplyOptionsFooter({
       applyLabel: '📋 Скопировать зоны',
       getShopCount: () => Object.keys(targetTree.getSelection()).length,
@@ -1962,7 +1971,7 @@
 
           showToast(`Копируем ${sourceZones.length} зон(ы) в ${targetShopIds.length} ресторан(ов)...`, 'info', 3000);
           const result = await copyZonesToShops(projectId, sourceZones, sourceAddress, targetShopIds, {
-            autoPublish: state.autoPublish, forcePublish: state.forcePublish
+            autoPublish: state.autoPublish, forcePublish: state.forcePublish, hideSource: hideSourceCb.checked
           });
 
           const addedEntries = Object.values(result.addedByShop);
