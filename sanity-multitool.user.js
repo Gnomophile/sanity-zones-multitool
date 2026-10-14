@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sanity — мультитул по зонам (Mass Update)
 // @namespace    starterapp-delivery-zones
-// @version      7.17
+// @version      7.18
 // @description  Единая модалка «Управление зонами» (кнопка в левом меню Studio, рядом с баннерами): вкладки «Условия» (точечный выбор полей + поиск блюда каталога для платных цен), «Копирование зон» (между любыми ресторанами), «Способы оплаты» (точечное вкл/выкл одного способа без замены всего списка) и «Способы получения» (массовое добавление самовывоза/приёма в зале в первую и первую активную зону ресторана), JSON-бэкап перед изменением, массовые операции с доп. подтверждением "Точно?" и риск-баннером при выборе нескольких ресторанов, умное отслеживание "своих" черновиков, предполётная проверка валидации Studio
 // @match        https://my.starterapp.ru/*
 // @grant        none
@@ -2097,7 +2097,22 @@
     paymentTitle.style.cssText = 'font-size:14px;color:var(--smt-text-secondary);margin-bottom:8px;';
     paymentTitle.textContent = 'Типы оплаты';
     body.appendChild(paymentTitle);
-    body.appendChild(buildPaymentTypesGrid([]));
+
+    // Для «В зале»: типы оплаты почти всегда совпадают с самовывозом, но сам
+    // самовывоз в разных ресторанах настроен по-разному — поэтому вместо
+    // общего списка берём типы оплаты самовывоза каждой конкретной зоны.
+    let copyCb = null;
+    if (method.value === 'indoor') {
+      const copyLabel = document.createElement('label');
+      copyLabel.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;color:var(--smt-text-primary);margin-bottom:10px;cursor:pointer;';
+      copyLabel.innerHTML = '<input type="checkbox" data-sz-payment-copy-pickup style="width:16px;height:16px;cursor:pointer;accent-color:var(--smt-accent);"> Скопировать с самовывоза (в каждом ресторане — свои)';
+      body.appendChild(copyLabel);
+      copyCb = copyLabel.querySelector('input');
+    }
+
+    const grid = buildPaymentTypesGrid([]);
+    body.appendChild(grid);
+    if (copyCb) copyCb.addEventListener('change', () => { grid.style.display = copyCb.checked ? 'none' : ''; });
 
     wrap.appendChild(body);
 
@@ -2157,7 +2172,8 @@
           value: m.value,
           label: m.label,
           active: sections[m.value].querySelector('[data-sz-fulfillment-active]').checked,
-          paymentTypes: readPaymentTypesGrid(sections[m.value].querySelector('[data-sz-payment-grid]'))
+          paymentTypes: readPaymentTypesGrid(sections[m.value].querySelector('[data-sz-payment-grid]')),
+          copyPaymentFrom: sections[m.value].querySelector('[data-sz-payment-copy-pickup]')?.checked ? 'pickup' : null
         }));
     }
 
@@ -2693,15 +2709,17 @@
 
     let typeRefs;
     try {
-      typeRefs = await fetchDeliveryTypeRefs(projectId, methods.map(m => m.value));
+      const neededTypes = new Set(methods.map(m => m.value));
+      for (const m of methods) if (m.copyPaymentFrom) neededTypes.add(m.copyPaymentFrom);
+      typeRefs = await fetchDeliveryTypeRefs(projectId, [...neededTypes]);
     } catch (e) {
       showToast('Ошибка загрузки каталога способов получения: ' + e.message, 'error');
       return;
     }
-    const missingCatalog = methods.filter(m => !typeRefs[m.value]);
+    const missingCatalog = methods.filter(m => !typeRefs[m.value] || (m.copyPaymentFrom && !typeRefs[m.copyPaymentFrom]));
     if (missingCatalog.length > 0) {
       showToast(
-        '⛔ В каталоге «Способы получения» не найдено: ' + missingCatalog.map(m => m.label).join(', ') +
+        '⛔ В каталоге «Способы получения» не найдено: ' + missingCatalog.map(m => m.copyPaymentFrom && !typeRefs[m.copyPaymentFrom] ? 'Самовывоз' : m.label).join(', ') +
         '. Создайте способ получения в Studio (раздел «Способы получения») и повторите.',
         'error', 12000
       );
@@ -2760,8 +2778,25 @@
           mutations.push({ createIfNotExists: { ...documents[0], _id: draftId } });
         }
 
+        // Типы оплаты источника (самовывоза) для «скопировать с самовывоза»:
+        // сначала из этой же зоны (уже существующий или добавленный этим же
+        // запуском), иначе — из любой другой зоны ресторана, где он есть.
+        const findSourcePayments = (zone, sourceValue, addedInZone) => {
+          const srcRef = typeRefs[sourceValue].ref;
+          const pick = z => (z.deliveryTypePrices || []).find(d => d.deliveryType?._ref === srcRef && Array.isArray(d.paymentTypes) && d.paymentTypes.length > 0);
+          const own = pick(zone);
+          if (own) return { paymentTypes: own.paymentTypes, fromZone: null };
+          if (addedInZone[sourceValue]?.length > 0) return { paymentTypes: addedInZone[sourceValue], fromZone: null };
+          for (const z of zones) {
+            const other = pick(z);
+            if (other) return { paymentTypes: other.paymentTypes, fromZone: z.name || '(без названия)' };
+          }
+          return null;
+        };
+
         const added = [];
         for (const zone of targetZones) {
+          const addedInZone = {};
           for (const method of methods) {
             const ref = typeRefs[method.value].ref;
             const already = (zone.deliveryTypePrices || []).some(d => d.deliveryType?._ref === ref);
@@ -2769,12 +2804,24 @@
               alreadyExists.push({ shopName, zoneName: zone.name || '(без названия)', methodLabel: method.label });
               continue;
             }
+            let paymentTypes = method.paymentTypes;
+            let note = '';
+            if (method.copyPaymentFrom) {
+              const src = findSourcePayments(zone, method.copyPaymentFrom, addedInZone);
+              if (!src) {
+                allWarnings.push(`${shopName} — «${zone.name || '(без названия)'}»: ${method.label} не добавлен — в ресторане нет самовывоза с типами оплаты, копировать неоткуда`);
+                continue;
+              }
+              paymentTypes = [...src.paymentTypes];
+              note = src.fromZone ? ` (оплата как у самовывоза зоны «${src.fromZone}»)` : ' (оплата как у самовывоза)';
+            }
+            addedInZone[method.value] = paymentTypes;
             const newDtp = {
               _key: newKey(), _type: 'deliveryTypePrice',
               deliveryType: { _type: 'reference', _ref: ref },
               deliveryTime: 0, minBasketPrice: 0, defaultDeliveryPrice: 0,
               dynamicCalc: false, deliveryPrice: [],
-              paymentTypes: method.paymentTypes,
+              paymentTypes,
               status: method.active
             };
             const path = `deliveryZones[_key=="${zone._key}"].deliveryTypePrices`;
@@ -2785,7 +2832,7 @@
                 insert: { after: `${path}[-1]`, items: [newDtp] }
               }
             });
-            added.push(`${method.label} → «${zone.name}»`);
+            added.push(`${method.label} → «${zone.name}»${note}`);
           }
         }
 
